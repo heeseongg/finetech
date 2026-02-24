@@ -10,8 +10,54 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
+from tabs.disclosure import render_disclosure_tab
+from tabs.flow import render_flow_tab
+from tabs.news import render_news_tab
+from tabs.price_chart import render_price_chart_tab
+from tabs.report import render_report_tab
 
 load_dotenv()
+
+KIS_BASE_URLS = {
+    "real": "https://openapi.koreainvestment.com:9443",
+    "demo": "https://openapivts.koreainvestment.com:29443",
+}
+
+
+def _get_env_first(*keys):
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_kis_env(kis_env):
+    env = str(kis_env or "real").strip().lower()
+    alias = {"prod": "real", "vps": "demo", "paper": "demo"}
+    return alias.get(env, env if env in KIS_BASE_URLS else "real")
+
+
+def _to_dataframe(value):
+    if isinstance(value, list):
+        return pd.DataFrame(value)
+    if isinstance(value, dict):
+        return pd.DataFrame([value])
+    return pd.DataFrame()
+
+
+def _to_numeric_series(series):
+    return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+
+def _find_first_matching_col(columns, patterns):
+    lowered = {c: str(c).lower() for c in columns}
+    for pattern in patterns:
+        p = pattern.lower()
+        for col, low in lowered.items():
+            if p in low:
+                return col
+    return None
 
 
 def _is_openai_quota_error(err):
@@ -198,6 +244,7 @@ def _clean_news_title(raw_title, summary_node):
     return "기사보기"
 
 
+@st.cache_data(ttl=180)
 def collect_mainnews_latest(max_pages=3, max_items=20):
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
     rows = []
@@ -244,6 +291,231 @@ def collect_mainnews_latest(max_pages=3, max_items=20):
     return rows
 
 
+POSITIVE_NEWS_KEYWORDS = [
+    "상승",
+    "호재",
+    "기대",
+    "개선",
+    "성장",
+    "확대",
+    "흑자",
+    "강세",
+    "회복",
+    "상향",
+    "급등",
+    "수혜",
+    "사상 최대",
+    "돌파",
+]
+
+NEGATIVE_NEWS_KEYWORDS = [
+    "하락",
+    "악재",
+    "우려",
+    "불확실성",
+    "둔화",
+    "적자",
+    "약세",
+    "축소",
+    "급락",
+    "하향",
+    "리스크",
+    "부진",
+    "부담",
+    "경고",
+    "충격",
+]
+
+STOCK_NAME_ALIASES = {
+    "삼성전자": ["삼성전자", "삼성", "반도체"],
+    "sk하이닉스": ["sk하이닉스", "하이닉스", "반도체"],
+    "현대차": ["현대차", "현대자동차", "완성차", "자동차"],
+    "기아": ["기아", "완성차", "자동차"],
+    "lg에너지솔루션": ["lg에너지솔루션", "배터리", "2차전지"],
+}
+
+
+def _news_sentiment_score(text):
+    t = str(text or "").lower()
+    pos = sum(1 for w in POSITIVE_NEWS_KEYWORDS if w in t)
+    neg = sum(1 for w in NEGATIVE_NEWS_KEYWORDS if w in t)
+    raw = pos - neg
+    if raw > 0:
+        return min(raw, 3) / 3
+    if raw < 0:
+        return max(raw, -3) / 3
+    return 0.0
+
+
+def _stock_keywords(stock_name):
+    norm = str(stock_name or "").strip()
+    base = [norm, norm.replace(" ", "")]
+    alias = STOCK_NAME_ALIASES.get(norm.lower(), [])
+    for word in alias:
+        base.append(str(word).strip())
+    seen = set()
+    out = []
+    for token in base:
+        low = token.lower()
+        if token and low not in seen:
+            seen.add(low)
+            out.append(token)
+    return out
+
+
+def _flow_signal_text(flow_df):
+    if flow_df.empty or {"외국인순매수", "기관순매수"}.issubset(flow_df.columns) is False:
+        return None, 0.0
+
+    latest = flow_df.dropna(subset=["외국인순매수", "기관순매수"]).tail(1)
+    if latest.empty:
+        return None, 0.0
+
+    frgn = float(latest.iloc[0]["외국인순매수"])
+    inst = float(latest.iloc[0]["기관순매수"])
+    denom = abs(frgn) + abs(inst)
+    flow_score = 0.0 if denom == 0 else max(-1.0, min(1.0, (frgn + inst) / denom))
+
+    if frgn > 0 and inst > 0:
+        return "외국인·기관 동반 순매수", flow_score
+    if frgn > 0:
+        return "외국인 순매수", flow_score
+    if inst > 0:
+        return "기관 순매수", flow_score
+    if frgn < 0 and inst < 0:
+        return "외국인·기관 동반 순매도", flow_score
+    return "수급 혼조", flow_score
+
+
+def build_investment_report(stock_name, news_rows, flow_df):
+    news_df = pd.DataFrame(news_rows)
+    if news_df.empty:
+        return {
+            "summary": "분석 가능한 뉴스가 부족합니다. 잠시 후 다시 시도해 주세요.",
+            "sentiment_pct": 50,
+            "sentiment_label": "Neutral",
+            "opinion": "관망",
+            "confidence": 50,
+            "trend_df": pd.DataFrame(columns=["일자", "감성지수"]),
+            "positive_points": [],
+            "negative_points": [],
+            "news_count": 0,
+        }
+
+    news_df["제목"] = news_df["제목"].astype(str).str.strip()
+    news_df["일시"] = pd.to_datetime(news_df["일시"], errors="coerce")
+    keywords = [k.lower() for k in _stock_keywords(stock_name)]
+
+    related_mask = news_df["제목"].str.lower().apply(lambda t: any(k in t for k in keywords))
+    related_df = news_df[related_mask].copy()
+    if related_df.empty:
+        related_df = news_df.copy()
+
+    related_df["sent_score"] = related_df["제목"].apply(_news_sentiment_score)
+    news_score = float(related_df["sent_score"].mean()) if not related_df.empty else 0.0
+
+    flow_text, flow_score = _flow_signal_text(flow_df)
+    combined_score = (news_score * 0.75) + (flow_score * 0.25)
+    sentiment_pct = int(round(max(0.0, min(100.0, 50 + combined_score * 50))))
+
+    if sentiment_pct >= 63:
+        sentiment_label = "Bullish"
+        opinion = "매수 우위"
+        signal_text = "긍정적인 신호"
+    elif sentiment_pct <= 37:
+        sentiment_label = "Bearish"
+        opinion = "매도 우위"
+        signal_text = "부정적인 신호"
+    else:
+        sentiment_label = "Neutral"
+        opinion = "관망"
+        signal_text = "중립 신호"
+
+    data_bonus = min(10, int(len(related_df) * 1.5))
+    confidence = int(max(45, min(95, 55 + abs(sentiment_pct - 50) * 0.6 + data_bonus + (5 if flow_text else 0))))
+
+    if flow_text:
+        first_sentence = f"최근 {flow_text}와 뉴스 흐름에서 {signal_text}가 포착되었습니다."
+    else:
+        first_sentence = f"최근 뉴스 흐름에서 {signal_text}가 포착되었습니다."
+
+    risk_words = ["금리", "환율", "인플레이션", "침체", "불확실성", "리스크"]
+    risk_exists = related_df["제목"].str.contains("|".join(risk_words), case=False, regex=True).any()
+    if risk_exists:
+        second_sentence = "다만 거시 환경 리스크와 단기 변동성에는 유의가 필요합니다."
+    else:
+        second_sentence = "다만 단기 변동성 확대 가능성은 함께 점검해야 합니다."
+
+    trend_df = related_df.dropna(subset=["일시"]).copy()
+    if not trend_df.empty:
+        trend_df["일자"] = trend_df["일시"].dt.normalize()
+        trend_df = trend_df.groupby("일자", as_index=False)["sent_score"].mean()
+        trend_df["감성지수"] = (50 + trend_df["sent_score"] * 50).clip(0, 100)
+        trend_df = trend_df[["일자", "감성지수"]].sort_values("일자")
+        if len(trend_df) > 7:
+            trend_df = trend_df.tail(7)
+        elif len(trend_df) < 7 and not trend_df.empty:
+            end_day = trend_df["일자"].max()
+            full_days = pd.date_range(end=end_day, periods=7, freq="D")
+            trend_df = (
+                pd.DataFrame({"일자": full_days})
+                .merge(trend_df, on="일자", how="left")
+                .fillna({"감성지수": 50})
+            )
+
+    def _to_point_records(df_slice):
+        records = []
+        for _, row in df_slice.iterrows():
+            title = str(row.get("제목", "")).strip()
+            if not title:
+                continue
+            link = str(row.get("기사링크", "")).strip()
+            item = {"text": title}
+            if link.startswith("http://") or link.startswith("https://"):
+                item["link"] = link
+            records.append(item)
+        return records
+
+    pos_points = _to_point_records(
+        related_df[related_df["sent_score"] > 0]
+        .sort_values(["sent_score", "일시"], ascending=[False, False])
+        .head(2)
+    )
+    neg_points = _to_point_records(
+        related_df[related_df["sent_score"] < 0]
+        .sort_values(["sent_score", "일시"], ascending=[True, False])
+        .head(2)
+    )
+
+    if not pos_points and not related_df.empty:
+        pos_points = _to_point_records(related_df.sort_values("일시", ascending=False).head(1))
+
+    return {
+        "summary": f"{first_sentence} {second_sentence}",
+        "sentiment_pct": sentiment_pct,
+        "sentiment_label": sentiment_label,
+        "opinion": opinion,
+        "confidence": confidence,
+        "trend_df": trend_df if isinstance(trend_df, pd.DataFrame) else pd.DataFrame(columns=["일자", "감성지수"]),
+        "positive_points": pos_points,
+        "negative_points": neg_points,
+        "news_count": int(len(related_df)),
+    }
+
+
+def render_investment_report(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
+    return render_report_tab(
+        stock_name=stock_name,
+        stock_code=stock_code,
+        kis_app_key=kis_app_key,
+        kis_app_secret=kis_app_secret,
+        kis_env=kis_env,
+        collect_mainnews_latest=collect_mainnews_latest,
+        get_kis_investor_flow=get_kis_investor_flow,
+        build_investment_report=build_investment_report,
+    )
+
+
 @st.cache_data(ttl=3600)
 def _fetch_stock_list_from_krx(market):
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
@@ -286,194 +558,222 @@ def get_stock_list(market):
     return pd.DataFrame(columns=["Code", "Name"])
 
 
-def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
-    st.header(f"🗂️ {stock_name} 최근 전자공시")
-    try:
-        dart = OpenDartReader(opendart_api)
-        start = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-        disclosures = dart.list(stock_code, start=start, final=False)
-        if disclosures is None or disclosures.empty:
-            disclosures = dart.list(stock_name, start=start, final=False)
-    except Exception as e:
-        st.error(f"전자공시 목록 조회 중 오류가 발생했습니다: {type(e).__name__} - {e}")
-        return
-
-    if disclosures is None or disclosures.empty:
-        st.info("최근 1년 내 공시가 없습니다.")
-        return
-
-    df = disclosures.copy()
-    if "rcept_dt" in df.columns:
-        df["rcept_dt"] = pd.to_datetime(df["rcept_dt"], format="%Y%m%d", errors="coerce")
-        df = df.sort_values("rcept_dt", ascending=False)
-    if {"rcept_no", "report_nm"}.issubset(df.columns):
-        report_title = (
-            df["report_nm"]
-            .fillna("보고서")
-            .astype(str)
-            .str.replace("\r", " ", regex=False)
-            .str.replace("\n", " ", regex=False)
-        )
-        df["report_nm_link"] = (
-            "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + df["rcept_no"].astype(str) + "#" + report_title
-        )
-
-    major_keywords = ["사업보고서", "반기보고서", "분기보고서", "감사보고서"]
-    if "report_nm" in df.columns:
-        major_mask = df["report_nm"].astype(str).apply(lambda x: any(k in x for k in major_keywords))
-    else:
-        major_mask = pd.Series([True] * len(df), index=df.index)
-
-    major_df = df[major_mask]
-    other_df = df[~major_mask]
-
-    report_col = "report_nm_link" if "report_nm_link" in df.columns else "report_nm"
-    display_cols = [c for c in ["rcept_dt", report_col, "flr_nm", "corp_name"] if c in df.columns]
-    rename_map = {
-        "rcept_dt": "접수일자",
-        "report_nm": "보고서명",
-        "report_nm_link": "보고서명",
-        "flr_nm": "제출인",
-        "corp_name": "회사명",
+@st.cache_data(ttl=3300, show_spinner=False)
+def _get_kis_access_token(app_key, app_secret, kis_env):
+    env = _normalize_kis_env(kis_env)
+    base_url = KIS_BASE_URLS.get(env, KIS_BASE_URLS["real"])
+    url = f"{base_url}/oauth2/tokenP"
+    payload = {"grant_type": "client_credentials", "appkey": app_key, "appsecret": app_secret}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "charset": "UTF-8",
     }
-    column_config = {}
-    if report_col == "report_nm_link":
-        column_config["보고서명"] = st.column_config.LinkColumn(
-            "보고서명",
-            display_text=r".*#(.*)$",
-        )
+    res = requests.post(url, json=payload, headers=headers, timeout=15)
+    res.raise_for_status()
+    body = res.json()
+    token = str(body.get("access_token", "")).strip()
+    if not token:
+        msg = str(body.get("msg1", "KIS access token 발급 실패")).strip()
+        raise RuntimeError(msg)
+    return token
 
-    tab_major, tab_other = st.tabs(["주요 보고서", "기타 보고서"])
 
-    with tab_major:
-        major_view = major_df[display_cols].rename(columns=rename_map).head(30)
-        if major_view.empty:
-            st.info("주요 보고서가 없습니다.")
-        else:
-            st.caption(f"최신순 상위 {len(major_view)}건")
-            st.dataframe(
-                major_view,
-                hide_index=True,
-                use_container_width=True,
-                column_config=column_config,
-            )
+def _kis_get(app_key, app_secret, kis_env, api_url, tr_id, params):
+    env = _normalize_kis_env(kis_env)
+    base_url = KIS_BASE_URLS.get(env, KIS_BASE_URLS["real"])
+    access_token = _get_kis_access_token(app_key, app_secret, env)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "charset": "UTF-8",
+        "authorization": f"Bearer {access_token}",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": tr_id,
+        "custtype": "P",
+    }
+    res = requests.get(f"{base_url}{api_url}", headers=headers, params=params, timeout=15)
+    res.raise_for_status()
+    body = res.json()
+    rt_cd = str(body.get("rt_cd", "0")).strip()
+    if rt_cd and rt_cd != "0":
+        msg_cd = str(body.get("msg_cd", "")).strip()
+        msg = str(body.get("msg1", "KIS API 호출 실패")).strip()
+        raise RuntimeError(f"{msg_cd} {msg}".strip())
+    return body
 
-            st.markdown("#### 주요 보고서 요약")
-            summary_n = st.slider(
-                "요약 대상 보고서 수",
-                1,
-                min(5, len(major_df)),
-                min(3, len(major_df)),
-                key=f"major_n_{stock_code}",
-            )
-            major_state_key = f"major_summary_text_{stock_code}"
 
-            if st.button("주요 보고서 요약 생성", key=f"major_btn_{stock_code}"):
-                with st.spinner("주요 보고서를 요약 중입니다..."):
-                    try:
-                        text, err = summarize_major_disclosures(dart, major_df, stock_name, openai_api_key, summary_n)
-                        if err:
-                            st.warning(err)
-                        else:
-                            st.success(f"최근 주요 보고서 {summary_n}건 요약 완료")
-                            st.session_state[major_state_key] = text
-                    except Exception as e:
-                        if _is_openai_quota_error(e):
-                            st.error("OpenAI API 사용 한도를 초과했습니다(429 insufficient_quota).")
-                        else:
-                            st.error(f"요약 중 오류가 발생했습니다: {type(e).__name__} - {e}")
+@st.cache_data(ttl=300, show_spinner=False)
+def get_kis_daily_ohlcv(stock_code, app_key, app_secret, kis_env, days=90):
+    end_date = datetime.date.today()
+    start_date = end_date - datetime.timedelta(days=max(days * 3, 180))
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+        "FHKST03010100",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_date.strftime("%Y%m%d"),
+            "FID_INPUT_DATE_2": end_date.strftime("%Y%m%d"),
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "1",
+        },
+    )
 
-            if major_state_key in st.session_state:
-                st.markdown(st.session_state[major_state_key])
+    df = _to_dataframe(body.get("output2"))
+    if df.empty:
+        return df
 
-    with tab_other:
-        other_view = other_df[display_cols].rename(columns=rename_map).head(30)
-        if other_view.empty:
-            st.info("기타 보고서가 없습니다.")
-        else:
-            st.caption(f"최신순 상위 {len(other_view)}건")
-            st.dataframe(
-                other_view,
-                hide_index=True,
-                use_container_width=True,
-                column_config=column_config,
-            )
+    rename_map = {
+        "stck_bsop_date": "일자",
+        "stck_oprc": "시가",
+        "stck_hgpr": "고가",
+        "stck_lwpr": "저가",
+        "stck_clpr": "종가",
+        "acml_vol": "거래량",
+        "prdy_vrss": "전일대비",
+    }
+    df = df.rename(columns=rename_map)
+
+    if "일자" in df.columns:
+        df["일자"] = pd.to_datetime(df["일자"], format="%Y%m%d", errors="coerce")
+        df = df.dropna(subset=["일자"]).sort_values("일자")
+
+    for col in ["시가", "고가", "저가", "종가", "거래량", "전일대비"]:
+        if col in df.columns:
+            df[col] = _to_numeric_series(df[col])
+
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_kis_investor_flow(stock_code, app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily",
+        "FHPTJ04160001",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": datetime.date.today().strftime("%Y%m%d"),
+            "FID_ORG_ADJ_PRC": "",
+            "FID_ETC_CLS_CODE": "",
+        },
+    )
+
+    df1 = _to_dataframe(body.get("output1"))
+    df2 = _to_dataframe(body.get("output2"))
+    df = df2 if len(df2) >= len(df1) else df1
+    if df.empty:
+        return df
+
+    date_col = _find_first_matching_col(
+        df.columns,
+        ["stck_bsop_date", "bsop_date", "trd_dd", "date", "dt"],
+    )
+    if date_col:
+        df = df.rename(columns={date_col: "일자"})
+        df["일자"] = pd.to_datetime(df["일자"], format="%Y%m%d", errors="coerce")
+
+    frgn_col = _find_first_matching_col(
+        df.columns,
+        ["frgn_ntby_qty", "frgn_ntby_tr_pbmn", "frgn_ntby_amt", "frgn_ntby", "frgn_net"],
+    )
+    prsn_col = _find_first_matching_col(
+        df.columns,
+        [
+            "prsn_ntby_qty",
+            "prsn_ntby_tr_pbmn",
+            "prsn_ntby_amt",
+            "prsn_ntby",
+            "prsn_net",
+            "indv_ntby_qty",
+            "indv_ntby_amt",
+            "indv_net",
+        ],
+    )
+    orgn_col = _find_first_matching_col(
+        df.columns,
+        ["orgn_ntby_qty", "orgn_ntby_tr_pbmn", "orgn_ntby_amt", "orgn_ntby", "orgn_net"],
+    )
+
+    rename_map = {}
+    if frgn_col:
+        rename_map[frgn_col] = "외국인순매수"
+    if prsn_col:
+        rename_map[prsn_col] = "개인순매수"
+    if orgn_col:
+        rename_map[orgn_col] = "기관순매수"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    for col in ["외국인순매수", "개인순매수", "기관순매수"]:
+        if col in df.columns:
+            df[col] = _to_numeric_series(df[col])
+
+    if "일자" in df.columns:
+        df = df.dropna(subset=["일자"]).sort_values("일자")
+
+    return df.reset_index(drop=True)
+
+
+def plot_kis_price_chart(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
+    return render_price_chart_tab(
+        stock_name=stock_name,
+        stock_code=stock_code,
+        kis_app_key=kis_app_key,
+        kis_app_secret=kis_app_secret,
+        kis_env=kis_env,
+        get_kis_daily_ohlcv=get_kis_daily_ohlcv,
+    )
+
+
+def plot_kis_investor_flow(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
+    return render_flow_tab(
+        stock_name=stock_name,
+        stock_code=stock_code,
+        kis_app_key=kis_app_key,
+        kis_app_secret=kis_app_secret,
+        kis_env=kis_env,
+        get_kis_investor_flow=get_kis_investor_flow,
+    )
+
+
+def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
+    return render_disclosure_tab(
+        stock_name=stock_name,
+        stock_code=stock_code,
+        opendart_api=opendart_api,
+        openai_api_key=openai_api_key,
+        summarize_major_disclosures=summarize_major_disclosures,
+        is_openai_quota_error=_is_openai_quota_error,
+    )
 
 
 def plot_latest_news(stock_name, stock_code, openai_api_key, max_items=20):
-    st.header(f"📰 {stock_name} 최신 주요뉴스")
-    try:
-        rows = collect_mainnews_latest(max_pages=5, max_items=max_items)
-    except Exception as e:
-        st.error(f"뉴스 조회 중 오류가 발생했습니다: {type(e).__name__} - {e}")
-        return
-
-    if not rows:
-        st.info("표시할 주요뉴스가 없습니다.")
-        return
-
-    news_df = pd.DataFrame(rows)
-    display_df = news_df.copy()
-    news_column_config = {}
-    if {"제목", "기사링크"}.issubset(display_df.columns):
-        title_text = (
-            display_df["제목"]
-            .fillna("")
-            .astype(str)
-            .str.replace("\r", " ", regex=False)
-            .str.replace("\n", " ", regex=False)
-            .str.strip()
-        )
-        invalid_title_mask = title_text.eq("") | title_text.str.match(r"^(https?://|www\.)", case=False, na=False)
-        title_text = title_text.mask(invalid_title_mask, "기사보기")
-        display_df["제목"] = display_df["기사링크"].astype(str) + "#" + title_text
-        news_column_config["제목"] = st.column_config.LinkColumn(
-            "제목",
-            display_text=r".*#(.*)$",
-        )
-    display_cols = [c for c in ["일시", "언론사", "제목"] if c in display_df.columns]
-    display_df = display_df[display_cols]
-
-    st.caption(f"최신순 상위 {len(news_df)}건")
-    st.dataframe(
-        display_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config=news_column_config,
+    return render_news_tab(
+        stock_name=stock_name,
+        stock_code=stock_code,
+        openai_api_key=openai_api_key,
+        collect_mainnews_latest=collect_mainnews_latest,
+        summarize_latest_news=summarize_latest_news,
+        is_openai_quota_error=_is_openai_quota_error,
+        max_items=max_items,
     )
-
-    st.markdown("#### 최신 뉴스 요약")
-    n = st.slider("요약 대상 뉴스 수", 1, min(10, len(news_df)), min(5, len(news_df)), key=f"news_n_{stock_code}")
-    news_state_key = f"news_summary_text_{stock_code}"
-
-    if st.button("최신 뉴스 요약 생성", key=f"news_btn_{stock_code}"):
-        with st.spinner("최신 뉴스를 요약 중입니다..."):
-            try:
-                text, err = summarize_latest_news(news_df, stock_name, openai_api_key, n)
-                if err:
-                    st.warning(err)
-                else:
-                    st.success(f"최근 뉴스 {n}건 요약 완료")
-                    st.session_state[news_state_key] = text
-            except Exception as e:
-                if _is_openai_quota_error(e):
-                    st.error("OpenAI API 사용 한도를 초과했습니다(429 insufficient_quota).")
-                else:
-                    st.error(f"요약 중 오류가 발생했습니다: {type(e).__name__} - {e}")
-
-    if news_state_key in st.session_state:
-        st.markdown(st.session_state[news_state_key])
 
 
 def app():
     st.set_page_config(page_title="SSAFY 금융 데이터 분석 GPT")
     st.title("SSAFY Project II")
-    st.subheader(": 전자공시 / 뉴스 조회 + AI 요약")
 
     stock_name = ""
     stock_code = ""
-    show_disclosure = False
-    show_news = False
     with st.sidebar:
         st.header("사용자 설정")
         market = st.selectbox("📌 시장 선정", ("KRX 전체", "KOSPI 코스피", "KOSDAQ 코스닥", "KONEX 코넥스"))
@@ -488,6 +788,9 @@ def app():
         st.subheader("API Key (.env)")
         opendart_api = os.getenv("OPENDART_API_KEY", "").strip()
         openai_api = os.getenv("OPENAI_API_KEY", "").strip()
+        kis_app_key = _get_env_first("KIS_APP_KEY", "KIS_APPKEY")
+        kis_app_secret = _get_env_first("KIS_APP_SECRET", "KIS_APPSECRET")
+        kis_env = _normalize_kis_env(_get_env_first("KIS_ENV"))
 
         if opendart_api:
             st.success("OpenDart API Key 로드 완료", icon="✅")
@@ -499,27 +802,48 @@ def app():
         else:
             st.warning("OPENAI_API_KEY가 .env에 없습니다.", icon="⚠️")
 
+        if kis_app_key and kis_app_secret:
+            st.success(f"KIS API Key 로드 완료 ({kis_env})", icon="✅")
+        else:
+            st.warning("KIS_APP_KEY / KIS_APP_SECRET가 .env에 없습니다.", icon="⚠️")
+
         if stock:
             stock_name = stock.split("(")[0]
             stock_code = stock.split("(")[-1][:-1]
-            st.subheader("옵션")
-            show_disclosure = st.checkbox("🗂️ 전자공시", value=True)
-            show_news = st.checkbox("📰 뉴스", value=True)
 
     if not stock_name:
         st.info("좌측에서 종목을 선택하세요.")
         return
 
     st.divider()
-    st.title(f"📌 《{stock_name} ({stock_code})》")
+    st.title(f"📌 {stock_name} ({stock_code})")
 
-    if show_disclosure:
+    tab_price_chart, tab_flow, tab_report, tab_disclosure, tab_news = st.tabs(
+        ["📈 주가 차트", "💹 외국인/기관 수급", "🧾 투자 분석 리포트", "🗂️ 전자공시", "📰 뉴스"]
+    )
+
+    with tab_price_chart:
+        if not kis_app_key or not kis_app_secret:
+            st.warning("KIS 주가 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
+        else:
+            plot_kis_price_chart(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+
+    with tab_flow:
+        if not kis_app_key or not kis_app_secret:
+            st.warning("외국인/기관 수급 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
+        else:
+            plot_kis_investor_flow(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+
+    with tab_report:
+        render_investment_report(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+
+    with tab_disclosure:
         if not opendart_api:
             st.warning("전자공시 조회를 위해 .env에 OPENDART_API_KEY를 설정하세요.")
         else:
             plot_disclosures(stock_name, stock_code, opendart_api, openai_api)
 
-    if show_news:
+    with tab_news:
         plot_latest_news(stock_name, stock_code, openai_api)
 
 
