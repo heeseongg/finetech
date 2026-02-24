@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Streamlit / app cache
+.streamlit/
+docs_cache/
+
+# Local environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build / temp artifacts
+*.log
+*.tmp
+*.bak
+
+# Large/local data artifacts (keep structure file-free by default)
+DB/text/
+DB/vector/
+
