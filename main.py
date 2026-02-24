@@ -174,100 +174,28 @@ def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
     return resp.choices[0].message.content, None
 
 
-STOCK_THEME_KEYWORDS = {
-    "삼성전자": ["삼성", "반도체", "메모리", "dram", "d램", "nand", "hbm", "파운드리", "램"],
-    "sk하이닉스": ["하이닉스", "반도체", "메모리", "dram", "d램", "nand", "hbm", "램"],
-    "현대차": ["현대자동차", "자동차", "완성차", "전기차", "배터리", "자율주행"],
-    "기아": ["자동차", "완성차", "전기차", "배터리", "자율주행"],
-    "lg에너지솔루션": ["배터리", "2차전지", "전기차", "양극재", "음극재"],
-    "삼성바이오로직스": ["바이오", "cdmo", "의약품", "제약", "바이오의약품"],
-}
+def _is_url_like_text(text):
+    t = (text or "").strip().lower()
+    return t.startswith(("http://", "https://", "www.")) or "finance.naver.com/news/" in t
 
 
-def _stock_related_keywords(stock_name):
-    base = [stock_name.strip()]
-    normalized = stock_name.strip().lower().replace(" ", "")
-    for key, words in STOCK_THEME_KEYWORDS.items():
-        key_norm = key.lower().replace(" ", "")
-        if key_norm in normalized or normalized in key_norm:
-            base.extend(words)
-
-    seen = set()
-    out = []
-    for k in base:
-        token = k.strip()
-        if not token:
-            continue
-        low = token.lower()
-        if low in seen:
-            continue
-        seen.add(low)
-        out.append(token)
-    return out
+def _extract_clean_summary_text(summary_node):
+    if not summary_node:
+        return ""
+    node = BeautifulSoup(str(summary_node), "html.parser")
+    for tag in node.select("span"):
+        tag.decompose()
+    return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
 
 
-def _contains_keyword(text, keywords):
-    t = (text or "").lower()
-    return any(k.lower() in t for k in keywords)
-
-
-def collect_mainnews_by_keywords(keywords, max_pages=5, max_items=20):
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
-    rows = []
-    seen_urls = set()
-
-    for page in range(1, max_pages + 1):
-        url = f"https://finance.naver.com/news/mainnews.naver?page={page}"
-        res = requests.get(url, headers=headers, timeout=10)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
-        items = soup.select("ul.newsList li")
-        if not items:
-            continue
-
-        for li in items:
-            a = li.select_one("dd.articleSubject a")
-            if not a:
-                continue
-            href = a.get("href", "")
-            if not href:
-                continue
-
-            news_url = "https://finance.naver.com" + href
-            if news_url in seen_urls:
-                continue
-
-            title = a.get_text(" ", strip=True)
-            summary_node = li.select_one("dd.articleSummary")
-            summary = summary_node.get_text(" ", strip=True) if summary_node else ""
-            press_node = li.select_one("span.press")
-            wdate_node = li.select_one("span.wdate")
-            press_text = press_node.get_text(strip=True) if press_node else ""
-            date_text = wdate_node.get_text(strip=True) if wdate_node else ""
-
-            hit = _contains_keyword(title, keywords) or _contains_keyword(summary, keywords)
-            if not hit:
-                try:
-                    body = fetch_news_article_text(news_url)
-                    hit = _contains_keyword(body, keywords)
-                except Exception:
-                    hit = False
-
-            if not hit:
-                continue
-
-            seen_urls.add(news_url)
-            rows.append(
-                {
-                    "일시": date_text,
-                    "언론사": press_text,
-                    "제목": title,
-                    "기사링크": news_url,
-                }
-            )
-            if len(rows) >= max_items:
-                return rows
-    return rows
+def _clean_news_title(raw_title, summary_node):
+    title = re.sub(r"\s+", " ", str(raw_title or "")).strip()
+    if title and not _is_url_like_text(title):
+        return title
+    summary_text = _extract_clean_summary_text(summary_node)
+    if summary_text and not _is_url_like_text(summary_text):
+        return summary_text
+    return "기사보기"
 
 
 def collect_mainnews_latest(max_pages=3, max_items=20):
@@ -295,7 +223,8 @@ def collect_mainnews_latest(max_pages=3, max_items=20):
             if news_url in seen_urls:
                 continue
 
-            title = a.get_text(" ", strip=True)
+            summary_node = li.select_one("dd.articleSummary")
+            title = _clean_news_title(a.get_text(" ", strip=True), summary_node)
             press_node = li.select_one("span.press")
             wdate_node = li.select_one("span.wdate")
             press_text = press_node.get_text(strip=True) if press_node else ""
@@ -377,8 +306,17 @@ def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
     if "rcept_dt" in df.columns:
         df["rcept_dt"] = pd.to_datetime(df["rcept_dt"], format="%Y%m%d", errors="coerce")
         df = df.sort_values("rcept_dt", ascending=False)
-    if "rcept_no" in df.columns:
-        df["공시보기"] = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + df["rcept_no"].astype(str)
+    if {"rcept_no", "report_nm"}.issubset(df.columns):
+        report_title = (
+            df["report_nm"]
+            .fillna("보고서")
+            .astype(str)
+            .str.replace("\r", " ", regex=False)
+            .str.replace("\n", " ", regex=False)
+        )
+        df["report_nm_link"] = (
+            "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + df["rcept_no"].astype(str) + "#" + report_title
+        )
 
     major_keywords = ["사업보고서", "반기보고서", "분기보고서", "감사보고서"]
     if "report_nm" in df.columns:
@@ -389,8 +327,21 @@ def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
     major_df = df[major_mask]
     other_df = df[~major_mask]
 
-    display_cols = [c for c in ["rcept_dt", "report_nm", "flr_nm", "corp_name", "공시보기"] if c in df.columns]
-    rename_map = {"rcept_dt": "접수일자", "report_nm": "보고서명", "flr_nm": "제출인", "corp_name": "회사명"}
+    report_col = "report_nm_link" if "report_nm_link" in df.columns else "report_nm"
+    display_cols = [c for c in ["rcept_dt", report_col, "flr_nm", "corp_name"] if c in df.columns]
+    rename_map = {
+        "rcept_dt": "접수일자",
+        "report_nm": "보고서명",
+        "report_nm_link": "보고서명",
+        "flr_nm": "제출인",
+        "corp_name": "회사명",
+    }
+    column_config = {}
+    if report_col == "report_nm_link":
+        column_config["보고서명"] = st.column_config.LinkColumn(
+            "보고서명",
+            display_text=r".*#(.*)$",
+        )
 
     tab_major, tab_other = st.tabs(["주요 보고서", "기타 보고서"])
 
@@ -404,7 +355,7 @@ def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
                 major_view,
                 hide_index=True,
                 use_container_width=True,
-                column_config={"공시보기": st.column_config.LinkColumn("공시보기", display_text="바로가기")},
+                column_config=column_config,
             )
 
             st.markdown("#### 주요 보고서 요약")
@@ -445,7 +396,7 @@ def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
                 other_view,
                 hide_index=True,
                 use_container_width=True,
-                column_config={"공시보기": st.column_config.LinkColumn("공시보기", display_text="바로가기")},
+                column_config=column_config,
             )
 
 
@@ -462,12 +413,33 @@ def plot_latest_news(stock_name, stock_code, openai_api_key, max_items=20):
         return
 
     news_df = pd.DataFrame(rows)
+    display_df = news_df.copy()
+    news_column_config = {}
+    if {"제목", "기사링크"}.issubset(display_df.columns):
+        title_text = (
+            display_df["제목"]
+            .fillna("")
+            .astype(str)
+            .str.replace("\r", " ", regex=False)
+            .str.replace("\n", " ", regex=False)
+            .str.strip()
+        )
+        invalid_title_mask = title_text.eq("") | title_text.str.match(r"^(https?://|www\.)", case=False, na=False)
+        title_text = title_text.mask(invalid_title_mask, "기사보기")
+        display_df["제목"] = display_df["기사링크"].astype(str) + "#" + title_text
+        news_column_config["제목"] = st.column_config.LinkColumn(
+            "제목",
+            display_text=r".*#(.*)$",
+        )
+    display_cols = [c for c in ["일시", "언론사", "제목"] if c in display_df.columns]
+    display_df = display_df[display_cols]
+
     st.caption(f"최신순 상위 {len(news_df)}건")
     st.dataframe(
-        news_df,
+        display_df,
         hide_index=True,
         use_container_width=True,
-        column_config={"기사링크": st.column_config.LinkColumn("기사링크", display_text="바로가기")},
+        column_config=news_column_config,
     )
 
     st.markdown("#### 최신 뉴스 요약")
