@@ -15,12 +15,44 @@ def _price_row_color(sign_value):
 def render_price_chart_tab(
     stock_name,
     stock_code,
+    stock_industry,
     kis_app_key,
     kis_app_secret,
     kis_env,
     get_kis_daily_ohlcv,
+    get_kis_realtime_price,
 ):
     st.subheader(f"📈 {stock_name} 주가 차트 (KIS)")
+    st.caption(f"산업군: {stock_industry or '정보 없음'}")
+    try:
+        rt = get_kis_realtime_price(stock_code, kis_app_key, kis_app_secret, kis_env)
+    except Exception:
+        rt = {}
+
+    price = rt.get("price")
+    change = rt.get("change")
+    rate = rt.get("change_rate")
+    asof = rt.get("asof", "")
+
+    if price is None:
+        st.caption("실시간 현재가를 불러오지 못했습니다.")
+    else:
+        if change is None:
+            delta_text = None
+        else:
+            arrow = "▲" if change > 0 else ("▼" if change < 0 else "-")
+            if rate is None:
+                delta_text = f"{arrow} {abs(change):,.0f}" if arrow != "-" else "- 0"
+            else:
+                delta_text = (
+                    f"{arrow} {abs(change):,.0f} ({abs(rate):.2f}%)"
+                    if arrow != "-"
+                    else f"- 0 ({abs(rate):.2f}%)"
+                )
+        st.metric("실시간 현재가", f"{price:,.0f}원", delta=delta_text)
+        if asof:
+            st.caption(f"기준시각: {asof}")
+
     days = st.slider("주가 조회 기간(거래일)", 20, 120, 60, key=f"kis_chart_days_{stock_code}")
 
     st.markdown("#### 주가 시계열")

@@ -3,7 +3,6 @@ import os
 import re
 
 import FinanceDataReader as fdr
-import OpenDartReader
 import pandas as pd
 import requests
 import streamlit as st
@@ -48,6 +47,13 @@ def _to_dataframe(value):
 
 def _to_numeric_series(series):
     return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+
+def _to_numeric_value(value):
+    num = _to_numeric_series(pd.Series([value])).iloc[0]
+    if pd.isna(num):
+        return None
+    return float(num)
 
 
 def _find_first_matching_col(columns, patterns):
@@ -503,19 +509,6 @@ def build_investment_report(stock_name, news_rows, flow_df):
     }
 
 
-def render_investment_report(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
-    return render_report_tab(
-        stock_name=stock_name,
-        stock_code=stock_code,
-        kis_app_key=kis_app_key,
-        kis_app_secret=kis_app_secret,
-        kis_env=kis_env,
-        collect_mainnews_latest=collect_mainnews_latest,
-        get_kis_investor_flow=get_kis_investor_flow,
-        build_investment_report=build_investment_report,
-    )
-
-
 @st.cache_data(ttl=3600)
 def _fetch_stock_list_from_krx(market):
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
@@ -602,6 +595,72 @@ def _kis_get(app_key, app_secret, kis_env, api_url, tr_id, params):
         msg = str(body.get("msg1", "KIS API 호출 실패")).strip()
         raise RuntimeError(f"{msg_cd} {msg}".strip())
     return body
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_kis_stock_industry(stock_code, app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "FHKST01010100",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+        },
+    )
+    output = body.get("output")
+    if not isinstance(output, dict):
+        return ""
+
+    for key in ("bstp_kor_isnm", "idst_nm", "sector_name", "industry_name"):
+        value = str(output.get(key, "")).strip()
+        if value and value.lower() != "nan":
+            return value
+
+    industry_col = _find_first_matching_col(output.keys(), ["industry", "sector", "업종"])
+    if not industry_col:
+        return ""
+    value = str(output.get(industry_col, "")).strip()
+    if value and value.lower() != "nan":
+        return value
+    return ""
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def get_kis_realtime_price(stock_code, app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "FHKST01010100",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+        },
+    )
+    output = body.get("output")
+    if not isinstance(output, dict):
+        return {}
+
+    price = _to_numeric_value(output.get("stck_prpr"))
+    change = _to_numeric_value(output.get("prdy_vrss"))
+    change_rate = _to_numeric_value(output.get("prdy_ctrt"))
+
+    date_raw = str(output.get("stck_bsop_date", "")).strip()
+    time_raw = str(output.get("stck_cntg_hour", "")).strip()
+    date_fmt = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:]}" if len(date_raw) == 8 and date_raw.isdigit() else ""
+    time_fmt = f"{time_raw[:2]}:{time_raw[2:4]}:{time_raw[4:]}" if len(time_raw) == 6 and time_raw.isdigit() else ""
+    asof = " ".join(x for x in [date_fmt, time_fmt] if x)
+
+    return {
+        "price": price,
+        "change": change,
+        "change_rate": change_rate,
+        "asof": asof,
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -723,57 +782,13 @@ def get_kis_investor_flow(stock_code, app_key, app_secret, kis_env):
     return df.reset_index(drop=True)
 
 
-def plot_kis_price_chart(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
-    return render_price_chart_tab(
-        stock_name=stock_name,
-        stock_code=stock_code,
-        kis_app_key=kis_app_key,
-        kis_app_secret=kis_app_secret,
-        kis_env=kis_env,
-        get_kis_daily_ohlcv=get_kis_daily_ohlcv,
-    )
-
-
-def plot_kis_investor_flow(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env):
-    return render_flow_tab(
-        stock_name=stock_name,
-        stock_code=stock_code,
-        kis_app_key=kis_app_key,
-        kis_app_secret=kis_app_secret,
-        kis_env=kis_env,
-        get_kis_investor_flow=get_kis_investor_flow,
-    )
-
-
-def plot_disclosures(stock_name, stock_code, opendart_api, openai_api_key):
-    return render_disclosure_tab(
-        stock_name=stock_name,
-        stock_code=stock_code,
-        opendart_api=opendart_api,
-        openai_api_key=openai_api_key,
-        summarize_major_disclosures=summarize_major_disclosures,
-        is_openai_quota_error=_is_openai_quota_error,
-    )
-
-
-def plot_latest_news(stock_name, stock_code, openai_api_key, max_items=20):
-    return render_news_tab(
-        stock_name=stock_name,
-        stock_code=stock_code,
-        openai_api_key=openai_api_key,
-        collect_mainnews_latest=collect_mainnews_latest,
-        summarize_latest_news=summarize_latest_news,
-        is_openai_quota_error=_is_openai_quota_error,
-        max_items=max_items,
-    )
-
-
 def app():
     st.set_page_config(page_title="SSAFY 금융 데이터 분석 GPT")
     st.title("SSAFY Project II")
 
     stock_name = ""
     stock_code = ""
+    stock_industry = ""
     with st.sidebar:
         st.header("사용자 설정")
         market = st.selectbox("📌 시장 선정", ("KRX 전체", "KOSPI 코스피", "KOSDAQ 코스닥", "KONEX 코넥스"))
@@ -810,6 +825,11 @@ def app():
         if stock:
             stock_name = stock.split("(")[0]
             stock_code = stock.split("(")[-1][:-1]
+            if kis_app_key and kis_app_secret:
+                try:
+                    stock_industry = get_kis_stock_industry(stock_code, kis_app_key, kis_app_secret, kis_env)
+                except Exception:
+                    stock_industry = ""
 
     if not stock_name:
         st.info("좌측에서 종목을 선택하세요.")
@@ -826,25 +846,64 @@ def app():
         if not kis_app_key or not kis_app_secret:
             st.warning("KIS 주가 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
         else:
-            plot_kis_price_chart(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+            render_price_chart_tab(
+                stock_name=stock_name,
+                stock_code=stock_code,
+                stock_industry=stock_industry,
+                kis_app_key=kis_app_key,
+                kis_app_secret=kis_app_secret,
+                kis_env=kis_env,
+                get_kis_daily_ohlcv=get_kis_daily_ohlcv,
+                get_kis_realtime_price=get_kis_realtime_price,
+            )
 
     with tab_flow:
         if not kis_app_key or not kis_app_secret:
             st.warning("외국인/기관 수급 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
         else:
-            plot_kis_investor_flow(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+            render_flow_tab(
+                stock_name=stock_name,
+                stock_code=stock_code,
+                kis_app_key=kis_app_key,
+                kis_app_secret=kis_app_secret,
+                kis_env=kis_env,
+                get_kis_investor_flow=get_kis_investor_flow,
+            )
 
     with tab_report:
-        render_investment_report(stock_name, stock_code, kis_app_key, kis_app_secret, kis_env)
+        render_report_tab(
+            stock_name=stock_name,
+            stock_code=stock_code,
+            kis_app_key=kis_app_key,
+            kis_app_secret=kis_app_secret,
+            kis_env=kis_env,
+            collect_mainnews_latest=collect_mainnews_latest,
+            get_kis_investor_flow=get_kis_investor_flow,
+            build_investment_report=build_investment_report,
+        )
 
     with tab_disclosure:
         if not opendart_api:
             st.warning("전자공시 조회를 위해 .env에 OPENDART_API_KEY를 설정하세요.")
         else:
-            plot_disclosures(stock_name, stock_code, opendart_api, openai_api)
+            render_disclosure_tab(
+                stock_name=stock_name,
+                stock_code=stock_code,
+                opendart_api=opendart_api,
+                openai_api_key=openai_api,
+                summarize_major_disclosures=summarize_major_disclosures,
+                is_openai_quota_error=_is_openai_quota_error,
+            )
 
     with tab_news:
-        plot_latest_news(stock_name, stock_code, openai_api)
+        render_news_tab(
+            stock_name=stock_name,
+            stock_code=stock_code,
+            openai_api_key=openai_api,
+            collect_mainnews_latest=collect_mainnews_latest,
+            summarize_latest_news=summarize_latest_news,
+            is_openai_quota_error=_is_openai_quota_error,
+        )
 
 
 app()
