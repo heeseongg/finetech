@@ -791,8 +791,7 @@ def app():
     stock_industry = ""
     with st.sidebar:
         st.header("사용자 설정")
-        market = st.selectbox("📌 시장 선정", ("KRX 전체", "KOSPI 코스피", "KOSDAQ 코스닥", "KONEX 코넥스"))
-        df_list = get_stock_list(market.split(" ")[0])
+        df_list = get_stock_list("KOSPI")
 
         stock = None
         if not df_list.empty:
@@ -837,6 +836,7 @@ def app():
 
     st.divider()
     st.title(f"📌 {stock_name} ({stock_code})")
+    st.caption(f" {stock_industry or '정보 없음'}")
 
     tab_price_chart, tab_flow, tab_report, tab_disclosure, tab_news = st.tabs(
         ["📈 주가 차트", "💹 외국인/기관 수급", "🧾 투자 분석 리포트", "🗂️ 전자공시", "📰 뉴스"]

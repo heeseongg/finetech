@@ -23,7 +23,6 @@ def render_price_chart_tab(
     get_kis_realtime_price,
 ):
     st.subheader(f"📈 {stock_name} 주가 차트 (KIS)")
-    st.caption(f"산업군: {stock_industry or '정보 없음'}")
     try:
         rt = get_kis_realtime_price(stock_code, kis_app_key, kis_app_secret, kis_env)
     except Exception:
