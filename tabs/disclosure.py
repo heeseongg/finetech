@@ -1,13 +1,51 @@
 import datetime
+import re
 
 import OpenDartReader
 import pandas as pd
 import streamlit as st
 
 
+def _normalize_text(value):
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(value or "")).lower()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_fund_disclosures(opendart_api, start):
+    dart = OpenDartReader(opendart_api)
+    df = dart.list(start=start, kind="G", final=False)
+    if isinstance(df, pd.DataFrame):
+        return df
+    return pd.DataFrame()
+
+
+def _filter_fund_disclosures_by_etf_name(df, stock_name):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    target = _normalize_text(stock_name)
+    if not target:
+        return pd.DataFrame()
+
+    report_series = df["report_nm"].fillna("").astype(str) if "report_nm" in df.columns else pd.Series("", index=df.index)
+    corp_series = df["corp_name"].fillna("").astype(str) if "corp_name" in df.columns else pd.Series("", index=df.index)
+    normalized = (report_series + " " + corp_series).map(_normalize_text)
+    mask = normalized.str.contains(target, regex=False, na=False)
+
+    if not mask.any():
+        tokens = [_normalize_text(t) for t in str(stock_name).split() if _normalize_text(t)]
+        if len(tokens) >= 2:
+            mask = pd.Series(True, index=df.index)
+            for token in tokens:
+                mask = mask & normalized.str.contains(token, regex=False, na=False)
+
+    return df[mask].copy()
+
+
 def render_disclosure_tab(
     stock_name,
     stock_code,
+    stock_market,
     opendart_api,
     openai_api_key,
     summarize_major_disclosures,
@@ -16,10 +54,21 @@ def render_disclosure_tab(
     st.header(f"🗂️ {stock_name} 최근 전자공시")
     try:
         dart = OpenDartReader(opendart_api)
-        start = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-        disclosures = dart.list(stock_code, start=start, final=False)
-        if disclosures is None or disclosures.empty:
-            disclosures = dart.list(stock_name, start=start, final=False)
+        market = str(stock_market or "").upper()
+        if market == "ETF":
+            # OpenDART fund disclosures without corp_code can only be queried up to 3 months.
+            disclosures = pd.DataFrame()
+            for lookback_days in (30, 90):
+                start = (datetime.date.today() - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+                fund_df = _fetch_fund_disclosures(opendart_api, start)
+                disclosures = _filter_fund_disclosures_by_etf_name(fund_df, stock_name)
+                if disclosures is not None and not disclosures.empty:
+                    break
+        else:
+            start = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+            disclosures = dart.list(stock_code, start=start, final=False)
+            if disclosures is None or disclosures.empty:
+                disclosures = dart.list(stock_name, start=start, final=False)
     except Exception as e:
         st.error(f"전자공시 목록 조회 중 오류가 발생했습니다: {type(e).__name__} - {e}")
         return

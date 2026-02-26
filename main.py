@@ -1,8 +1,8 @@
 ﻿import datetime
 import os
 import re
+import time
 
-import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import streamlit as st
@@ -14,6 +14,7 @@ from tabs.flow import render_flow_tab
 from tabs.news import render_news_tab
 from tabs.price_chart import render_price_chart_tab
 from tabs.report import render_report_tab
+from tabs.valuation import render_valuation_tab
 
 load_dotenv()
 
@@ -50,7 +51,7 @@ def _to_numeric_series(series):
 
 
 def _to_numeric_value(value):
-    num = _to_numeric_series(pd.Series([value])).iloc[0]
+    num = pd.to_numeric(str(value).replace(",", ""), errors="coerce")
     if pd.isna(num):
         return None
     return float(num)
@@ -332,12 +333,33 @@ NEGATIVE_NEWS_KEYWORDS = [
     "충격",
 ]
 
-STOCK_NAME_ALIASES = {
-    "삼성전자": ["삼성전자", "삼성", "반도체"],
-    "sk하이닉스": ["sk하이닉스", "하이닉스", "반도체"],
-    "현대차": ["현대차", "현대자동차", "완성차", "자동차"],
-    "기아": ["기아", "완성차", "자동차"],
-    "lg에너지솔루션": ["lg에너지솔루션", "배터리", "2차전지"],
+GENERIC_NAME_TOKENS = {
+    "etf",
+    "tr",
+    "액티브",
+    "합성",
+    "선물",
+    "인버스",
+    "레버리지",
+    "증권",
+    "채권",
+    "회사채",
+    "국고채",
+}
+
+ETF_BRAND_TOKENS = {
+    "kodex",
+    "tiger",
+    "ace",
+    "arirang",
+    "kindex",
+    "kbstar",
+    "hanaro",
+    "rise",
+    "sol",
+    "plus",
+    "kosef",
+    "1q",
 }
 
 
@@ -353,17 +375,54 @@ def _news_sentiment_score(text):
     return 0.0
 
 
+def _normalize_keyword_token(token):
+    return re.sub(r"[^0-9A-Za-z가-힣&]+", "", str(token or "")).lower()
+
+
 def _stock_keywords(stock_name):
     norm = str(stock_name or "").strip()
-    base = [norm, norm.replace(" ", "")]
-    alias = STOCK_NAME_ALIASES.get(norm.lower(), [])
-    for word in alias:
-        base.append(str(word).strip())
+    if not norm:
+        return []
+
+    base = [norm, re.sub(r"\s+", "", norm)]
+    split_tokens = [t.strip() for t in re.split(r"[^0-9A-Za-z가-힣&]+", norm) if str(t).strip()]
+
+    normalized_tokens = []
+    for token in split_tokens:
+        low = _normalize_keyword_token(token)
+        if not low or len(low) < 2:
+            continue
+        if low.isdigit() and len(low) <= 3:
+            continue
+        normalized_tokens.append((token, low))
+
+    for token, low in normalized_tokens:
+        if low in GENERIC_NAME_TOKENS or low in ETF_BRAND_TOKENS:
+            continue
+        base.append(token)
+        if "&" in token:
+            base.append(token.replace("&", ""))
+
+    brand_token = ""
+    core_token = ""
+    for token, low in normalized_tokens:
+        if not brand_token and low in ETF_BRAND_TOKENS:
+            brand_token = token
+            continue
+        if not core_token and low not in ETF_BRAND_TOKENS and low not in GENERIC_NAME_TOKENS:
+            core_token = token
+    if brand_token and core_token:
+        base.append(f"{brand_token} {core_token}")
+        base.append(f"{brand_token}{core_token}")
+
     seen = set()
     out = []
     for token in base:
+        token = str(token).strip()
+        if not token:
+            continue
         low = token.lower()
-        if token and low not in seen:
+        if low not in seen:
             seen.add(low)
             out.append(token)
     return out
@@ -393,7 +452,16 @@ def _flow_signal_text(flow_df):
     return "수급 혼조", flow_score
 
 
+def _sentiment_meta(sentiment_pct):
+    if sentiment_pct >= 63:
+        return "Bullish", "매수 우위", "긍정적인 신호"
+    if sentiment_pct <= 37:
+        return "Bearish", "매도 우위", "부정적인 신호"
+    return "Neutral", "관망", "중립 신호"
+
+
 def build_investment_report(stock_name, news_rows, flow_df):
+    empty_trend_df = pd.DataFrame(columns=["일자", "감성지수"])
     news_df = pd.DataFrame(news_rows)
     if news_df.empty:
         return {
@@ -402,7 +470,7 @@ def build_investment_report(stock_name, news_rows, flow_df):
             "sentiment_label": "Neutral",
             "opinion": "관망",
             "confidence": 50,
-            "trend_df": pd.DataFrame(columns=["일자", "감성지수"]),
+            "trend_df": empty_trend_df,
             "positive_points": [],
             "negative_points": [],
             "news_count": 0,
@@ -412,30 +480,49 @@ def build_investment_report(stock_name, news_rows, flow_df):
     news_df["일시"] = pd.to_datetime(news_df["일시"], errors="coerce")
     keywords = [k.lower() for k in _stock_keywords(stock_name)]
 
-    related_mask = news_df["제목"].str.lower().apply(lambda t: any(k in t for k in keywords))
-    related_df = news_df[related_mask].copy()
-    if related_df.empty:
-        related_df = news_df.copy()
-
-    related_df["sent_score"] = related_df["제목"].apply(_news_sentiment_score)
-    news_score = float(related_df["sent_score"].mean()) if not related_df.empty else 0.0
+    related_df = pd.DataFrame(columns=news_df.columns)
+    if keywords:
+        related_mask = news_df["제목"].str.lower().apply(lambda t: any(k in t for k in keywords))
+        related_df = news_df[related_mask].copy()
 
     flow_text, flow_score = _flow_signal_text(flow_df)
+
+    if related_df.empty:
+        if flow_text:
+            sentiment_pct = int(round(max(0.0, min(100.0, 50 + flow_score * 25))))
+            sentiment_label, opinion, signal_text = _sentiment_meta(sentiment_pct)
+            summary = (
+                f"{stock_name} 관련 뉴스가 부족하여 수급 데이터 중심으로 판단했습니다. "
+                f"최근 {flow_text} 흐름에서 {signal_text}가 관찰됩니다."
+            )
+            confidence = 45
+        else:
+            sentiment_pct = 50
+            sentiment_label, opinion, _ = _sentiment_meta(sentiment_pct)
+            summary = (
+                f"{stock_name} 관련 뉴스가 부족해 현재는 유의미한 신호가 부족합니다. "
+                "추가 뉴스 확인 전까지 관망이 적절합니다."
+            )
+            confidence = 40
+
+        return {
+            "summary": summary,
+            "sentiment_pct": sentiment_pct,
+            "sentiment_label": sentiment_label,
+            "opinion": opinion,
+            "confidence": confidence,
+            "trend_df": empty_trend_df,
+            "positive_points": [],
+            "negative_points": [],
+            "news_count": 0,
+        }
+
+    related_df["sent_score"] = related_df["제목"].apply(_news_sentiment_score)
+    news_score = float(related_df["sent_score"].mean())
+
     combined_score = (news_score * 0.75) + (flow_score * 0.25)
     sentiment_pct = int(round(max(0.0, min(100.0, 50 + combined_score * 50))))
-
-    if sentiment_pct >= 63:
-        sentiment_label = "Bullish"
-        opinion = "매수 우위"
-        signal_text = "긍정적인 신호"
-    elif sentiment_pct <= 37:
-        sentiment_label = "Bearish"
-        opinion = "매도 우위"
-        signal_text = "부정적인 신호"
-    else:
-        sentiment_label = "Neutral"
-        opinion = "관망"
-        signal_text = "중립 신호"
+    sentiment_label, opinion, signal_text = _sentiment_meta(sentiment_pct)
 
     data_bonus = min(10, int(len(related_df) * 1.5))
     confidence = int(max(45, min(95, 55 + abs(sentiment_pct - 50) * 0.6 + data_bonus + (5 if flow_text else 0))))
@@ -453,7 +540,9 @@ def build_investment_report(stock_name, news_rows, flow_df):
         second_sentence = "다만 단기 변동성 확대 가능성은 함께 점검해야 합니다."
 
     trend_df = related_df.dropna(subset=["일시"]).copy()
-    if not trend_df.empty:
+    if trend_df.empty:
+        trend_df = empty_trend_df
+    else:
         trend_df["일자"] = trend_df["일시"].dt.normalize()
         trend_df = trend_df.groupby("일자", as_index=False)["sent_score"].mean()
         trend_df["감성지수"] = (50 + trend_df["sent_score"] * 50).clip(0, 100)
@@ -502,7 +591,7 @@ def build_investment_report(stock_name, news_rows, flow_df):
         "sentiment_label": sentiment_label,
         "opinion": opinion,
         "confidence": confidence,
-        "trend_df": trend_df if isinstance(trend_df, pd.DataFrame) else pd.DataFrame(columns=["일자", "감성지수"]),
+        "trend_df": trend_df,
         "positive_points": pos_points,
         "negative_points": neg_points,
         "news_count": int(len(related_df)),
@@ -511,6 +600,7 @@ def build_investment_report(stock_name, news_rows, flow_df):
 
 @st.cache_data(ttl=3600)
 def _fetch_stock_list_from_krx(market):
+    market = str(market or "KRX").upper()
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
     r = requests.post(
         "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
@@ -522,33 +612,192 @@ def _fetch_stock_list_from_krx(market):
     data = r.json().get("block1", [])
     df = pd.DataFrame(data)
     if df.empty:
-        return df
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
     df = df.rename(columns={"short_code": "Code", "codeName": "Name", "marketEngName": "Market"})
-    df["Code"] = df["Code"].astype(str).str.zfill(6)
+    df["Code"] = df["Code"].astype(str).str.strip().str.zfill(6)
+    df["Name"] = df["Name"].astype(str).str.strip()
     if market != "KRX":
         df = df[df["Market"].astype(str).str.upper() == market]
-    return df[["Code", "Name", "Market"]].reset_index(drop=True)
+    return (
+        df[["Code", "Name", "Market"]]
+        .dropna(subset=["Code", "Name"])
+        .drop_duplicates("Code")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=3600)
+def _fetch_etf_list_from_krx():
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
+    r = requests.post(
+        "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+        headers=headers,
+        data={
+            "bld": "dbms/comm/finder/finder_secuprodisu",
+            "mktsel": "ETF",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json().get("block1", [])
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    df = df.rename(columns={"short_code": "Code", "codeName": "Name"})
+    df["Code"] = df["Code"].astype(str).str.strip().str.zfill(6)
+    df["Name"] = df["Name"].astype(str).str.strip()
+    df["Market"] = "ETF"
+    return (
+        df[["Code", "Name", "Market"]]
+        .dropna(subset=["Code", "Name"])
+        .drop_duplicates("Code")
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(ttl=3600)
 def get_stock_list(market):
     market = str(market).upper()
-    for target in ([market] if market == "KRX" else [market, "KRX"]):
-        try:
-            df = fdr.StockListing(target)
-            if df is not None and not df.empty:
-                if target == "KRX" and market != "KRX" and "Market" in df.columns:
-                    filtered = df[df["Market"].astype(str).str.upper() == market]
-                    if not filtered.empty:
-                        return filtered.reset_index(drop=True)
-                    continue
-                return df.reset_index(drop=True)
-        except Exception:
-            pass
-    fallback = _fetch_stock_list_from_krx(market)
-    if fallback is not None and not fallback.empty:
-        return fallback
-    return pd.DataFrame(columns=["Code", "Name"])
+    try:
+        if market == "ETF":
+            return _fetch_etf_list_from_krx()
+        if market in {"KOSPI", "KOSDAQ", "KONEX", "KRX"}:
+            return _fetch_stock_list_from_krx(market)
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _parse_kis_rank_output(body, value_patterns):
+    df = _to_dataframe(body.get("output"))
+    if df.empty:
+        return pd.DataFrame(columns=["Code", "Value", "Rank"])
+
+    code_col = _find_first_matching_col(df.columns, ["mksc_shrn_iscd", "stck_shrn_iscd", "isu_cd", "code"])
+    rank_col = _find_first_matching_col(df.columns, ["data_rank", "rank"])
+    value_col = _find_first_matching_col(df.columns, value_patterns)
+    if not code_col:
+        return pd.DataFrame(columns=["Code", "Value", "Rank"])
+
+    out = pd.DataFrame({"Code": df[code_col].astype(str).str.strip().str.zfill(6)})
+    out["Value"] = _to_numeric_series(df[value_col]) if value_col else pd.NA
+    out["Rank"] = _to_numeric_series(df[rank_col]) if rank_col else pd.NA
+    return out.dropna(subset=["Code"]).drop_duplicates("Code").reset_index(drop=True)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_kis_volume_rank(app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/volume-rank",
+        "FHPST01710000",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "0",
+            "FID_INPUT_PRICE_2": "99999999",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        },
+    )
+    return _parse_kis_rank_output(body, ["acml_vol", "vol"])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_kis_trade_value_rank(app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/volume-rank",
+        "FHPST01710000",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "3",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "0",
+            "FID_INPUT_PRICE_2": "99999999",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        },
+    )
+    return _parse_kis_rank_output(body, ["acml_tr_pbmn", "avrg_tr_pbmn", "tr_pbmn", "amount"])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_kis_market_cap_rank(app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/ranking/market-cap",
+        "FHPST01740000",
+        {
+            "FID_INPUT_PRICE_2": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20174",
+            "FID_DIV_CLS_CODE": "0",
+            "FID_INPUT_ISCD": "0000",
+            "FID_TRGT_CLS_CODE": "0",
+            "FID_TRGT_EXLS_CLS_CODE": "0",
+            "FID_INPUT_PRICE_1": "",
+            "FID_VOL_CNT": "",
+        },
+    )
+    return _parse_kis_rank_output(body, ["stck_avls", "market_cap", "mktcap"])
+
+
+def _sort_stock_list_by_rank(df_list, rank_df):
+    if df_list is None or df_list.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    base = df_list.copy()
+    if rank_df is None or rank_df.empty:
+        return base.sort_values("Name").reset_index(drop=True)
+
+    merged = base.merge(rank_df, on="Code", how="left")
+    merged["__rank"] = _to_numeric_series(merged["Rank"])
+    merged["__value"] = _to_numeric_series(merged["Value"])
+    merged["__rank_order"] = merged["__rank"].fillna(10**9)
+    merged["__value_order"] = merged["__value"].fillna(-1)
+    merged = merged.sort_values(
+        ["__rank_order", "__value_order", "Name"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    return merged[["Code", "Name", "Market"]].reset_index(drop=True)
+
+
+def _sort_stock_list_by_name(df_list):
+    if df_list is None or df_list.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+    return df_list.sort_values("Name").reset_index(drop=True)
+
+
+def _get_rank_dataframe(sort_mode, app_key, app_secret, kis_env):
+    fetchers = {
+        "시가총액": get_kis_market_cap_rank,
+        "거래대금": get_kis_trade_value_rank,
+        "거래량": get_kis_volume_rank,
+    }
+    fetcher = fetchers.get(str(sort_mode))
+    if not fetcher:
+        return pd.DataFrame(columns=["Code", "Value", "Rank"])
+    return fetcher(app_key, app_secret, kis_env)
 
 
 @st.cache_data(ttl=3300, show_spinner=False)
@@ -660,6 +909,98 @@ def get_kis_realtime_price(stock_code, app_key, app_secret, kis_env):
         "change": change,
         "change_rate": change_rate,
         "asof": asof,
+    }
+
+
+def _extract_latest_numeric_ratio(ratio_df, value_col, period_col):
+    if ratio_df is None or ratio_df.empty or not value_col:
+        return None, ""
+
+    ordered = ratio_df.copy()
+    if period_col:
+        ordered["__period"] = _to_numeric_series(ordered[period_col])
+        ordered = ordered.sort_values("__period", ascending=False, na_position="last")
+
+    for _, row in ordered.iterrows():
+        value = _to_numeric_value(row.get(value_col))
+        if value is not None:
+            period = str(row.get(period_col, "")).strip() if period_col else ""
+            return value, period
+
+    if period_col and not ordered.empty:
+        return None, str(ordered.iloc[0].get(period_col, "")).strip()
+    return None, ""
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_kis_valuation_metrics(stock_code, app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/domestic-stock/v1/quotations/inquire-price",
+        "FHKST01010100",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+        },
+    )
+    output = body.get("output") if isinstance(body.get("output"), dict) else {}
+
+    per = _to_numeric_value(output.get("per"))
+    pbr = _to_numeric_value(output.get("pbr"))
+    eps = _to_numeric_value(output.get("eps"))
+    bps = _to_numeric_value(output.get("bps"))
+
+    date_raw = str(output.get("stck_bsop_date", "")).strip()
+    asof = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:]}" if len(date_raw) == 8 and date_raw.isdigit() else ""
+
+    ev_ebitda = None
+    ebitda = None
+    ratio_period = ""
+    ratio_df = pd.DataFrame()
+
+    for div_cls_code in ("0", "1"):
+        for _ in range(2):
+            try:
+                ratio_body = _kis_get(
+                    app_key,
+                    app_secret,
+                    kis_env,
+                    "/uapi/domestic-stock/v1/finance/other-major-ratios",
+                    "FHKST66430500",
+                    {
+                        "FID_INPUT_ISCD": stock_code,
+                        "FID_DIV_CLS_CODE": div_cls_code,
+                        "FID_COND_MRKT_DIV_CODE": "J",
+                    },
+                )
+                ratio_df = _to_dataframe(ratio_body.get("output"))
+                if not ratio_df.empty:
+                    break
+            except Exception:
+                time.sleep(0.2)
+        if not ratio_df.empty:
+            break
+
+    if not ratio_df.empty:
+        period_col = _find_first_matching_col(ratio_df.columns, ["stac_yymm", "stac_ym", "yymm", "year"])
+        ev_col = _find_first_matching_col(ratio_df.columns, ["ev_ebitda", "ev/ebitda"])
+        ebitda_col = _find_first_matching_col(ratio_df.columns, ["ebitda"])
+
+        ev_ebitda, ev_period = _extract_latest_numeric_ratio(ratio_df, ev_col, period_col)
+        ebitda, ebitda_period = _extract_latest_numeric_ratio(ratio_df, ebitda_col, period_col)
+        ratio_period = ev_period or ebitda_period or ""
+
+    return {
+        "per": per,
+        "pbr": pbr,
+        "ev_ebitda": ev_ebitda,
+        "eps": eps,
+        "bps": bps,
+        "ebitda": ebitda,
+        "asof": asof,
+        "ratio_period": ratio_period,
     }
 
 
@@ -783,29 +1124,59 @@ def get_kis_investor_flow(stock_code, app_key, app_secret, kis_env):
 
 
 def app():
-    st.set_page_config(page_title="SSAFY 금융 데이터 분석 GPT")
-    st.title("SSAFY Project II")
+    st.set_page_config(page_title="금융 프로젝트")
 
     stock_name = ""
     stock_code = ""
     stock_industry = ""
+    stock_market = ""
     with st.sidebar:
-        st.header("사용자 설정")
-        df_list = get_stock_list("KOSPI")
-
-        stock = None
-        if not df_list.empty:
-            stock = st.selectbox("📌 종목 선정", (f"{nm}({cd})" for cd, nm in zip(list(df_list["Code"]), list(df_list["Name"]))))
-        else:
-            st.warning("선택 가능한 종목이 없습니다.")
-
-        st.subheader("API Key (.env)")
+        st.header("KOSPI")
         opendart_api = os.getenv("OPENDART_API_KEY", "").strip()
         openai_api = os.getenv("OPENAI_API_KEY", "").strip()
         kis_app_key = _get_env_first("KIS_APP_KEY", "KIS_APPKEY")
         kis_app_secret = _get_env_first("KIS_APP_SECRET", "KIS_APPSECRET")
         kis_env = _normalize_kis_env(_get_env_first("KIS_ENV"))
 
+        product_type = st.selectbox("📂 종목유형", ("주식", "ETF"), index=0)
+        market = "KOSPI" if product_type == "주식" else "ETF"
+        sort_mode = st.selectbox("정렬", ("시가총액", "거래대금", "거래량", "이름"), index=0)
+        df_list = get_stock_list(market)
+
+        if not df_list.empty:
+            if sort_mode == "이름":
+                df_list = _sort_stock_list_by_name(df_list)
+            elif kis_app_key and kis_app_secret:
+                try:
+                    rank_df = _get_rank_dataframe(sort_mode, kis_app_key, kis_app_secret, kis_env)
+
+                    if rank_df is None or rank_df.empty:
+                        df_list = _sort_stock_list_by_name(df_list)
+                        st.caption(f"KIS {sort_mode} 랭킹 데이터가 없어 이름순 정렬")
+                    else:
+                        df_list = _sort_stock_list_by_rank(df_list, rank_df)
+                        st.caption(f"KIS {sort_mode} 랭킹 기준 상위 종목 우선 정렬")
+                except Exception:
+                    df_list = _sort_stock_list_by_name(df_list)
+                    st.caption(f"{sort_mode} 정렬 실패로 이름순 정렬")
+            else:
+                df_list = _sort_stock_list_by_name(df_list)
+                st.caption("KIS 키가 없어 이름순 정렬")
+
+        selected = None
+        if not df_list.empty:
+            options = list(
+                zip(
+                    df_list["Code"].astype(str),
+                    df_list["Name"].astype(str),
+                    df_list["Market"].astype(str),
+                )
+            )
+            selected = st.selectbox("📌 종목 선정", options, format_func=lambda x: f"{x[1]}({x[0]})")
+        else:
+            st.warning("선택 가능한 종목이 없습니다.")
+
+        st.subheader("API Key (.env)")
         if opendart_api:
             st.success("OpenDart API Key 로드 완료", icon="✅")
         else:
@@ -821,9 +1192,8 @@ def app():
         else:
             st.warning("KIS_APP_KEY / KIS_APP_SECRET가 .env에 없습니다.", icon="⚠️")
 
-        if stock:
-            stock_name = stock.split("(")[0]
-            stock_code = stock.split("(")[-1][:-1]
+        if selected:
+            stock_code, stock_name, stock_market = selected
             if kis_app_key and kis_app_secret:
                 try:
                     stock_industry = get_kis_stock_industry(stock_code, kis_app_key, kis_app_secret, kis_env)
@@ -834,15 +1204,17 @@ def app():
         st.info("좌측에서 종목을 선택하세요.")
         return
 
-    st.divider()
     st.title(f"📌 {stock_name} ({stock_code})")
     st.caption(f" {stock_industry or '정보 없음'}")
 
-    tab_price_chart, tab_flow, tab_report, tab_disclosure, tab_news = st.tabs(
-        ["📈 주가 차트", "💹 외국인/기관 수급", "🧾 투자 분석 리포트", "🗂️ 전자공시", "📰 뉴스"]
-    )
+    include_valuation_tab = str(stock_market or "").upper() != "ETF"
+    tab_labels = ["📈 주가 차트", "💹 외국인/기관 수급"]
+    if include_valuation_tab:
+        tab_labels.append("📊 밸류 지표")
+    tab_labels.extend(["🧾 투자 분석 리포트", "🗂️ 전자공시", "📰 뉴스"])
+    tabs = dict(zip(tab_labels, st.tabs(tab_labels)))
 
-    with tab_price_chart:
+    with tabs["📈 주가 차트"]:
         if not kis_app_key or not kis_app_secret:
             st.warning("KIS 주가 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
         else:
@@ -857,7 +1229,21 @@ def app():
                 get_kis_realtime_price=get_kis_realtime_price,
             )
 
-    with tab_flow:
+    if include_valuation_tab:
+        with tabs["📊 밸류 지표"]:
+            if not kis_app_key or not kis_app_secret:
+                st.warning("밸류 지표 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
+            else:
+                render_valuation_tab(
+                    stock_name=stock_name,
+                    stock_code=stock_code,
+                    kis_app_key=kis_app_key,
+                    kis_app_secret=kis_app_secret,
+                    kis_env=kis_env,
+                    get_kis_valuation_metrics=get_kis_valuation_metrics,
+                )
+
+    with tabs["💹 외국인/기관 수급"]:
         if not kis_app_key or not kis_app_secret:
             st.warning("외국인/기관 수급 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
         else:
@@ -870,7 +1256,7 @@ def app():
                 get_kis_investor_flow=get_kis_investor_flow,
             )
 
-    with tab_report:
+    with tabs["🧾 투자 분석 리포트"]:
         render_report_tab(
             stock_name=stock_name,
             stock_code=stock_code,
@@ -882,20 +1268,21 @@ def app():
             build_investment_report=build_investment_report,
         )
 
-    with tab_disclosure:
+    with tabs["🗂️ 전자공시"]:
         if not opendart_api:
             st.warning("전자공시 조회를 위해 .env에 OPENDART_API_KEY를 설정하세요.")
         else:
             render_disclosure_tab(
                 stock_name=stock_name,
                 stock_code=stock_code,
+                stock_market=stock_market,
                 opendart_api=opendart_api,
                 openai_api_key=openai_api,
                 summarize_major_disclosures=summarize_major_disclosures,
                 is_openai_quota_error=_is_openai_quota_error,
             )
 
-    with tab_news:
+    with tabs["📰 뉴스"]:
         render_news_tab(
             stock_name=stock_name,
             stock_code=stock_code,
@@ -907,3 +1294,4 @@ def app():
 
 
 app()
+
