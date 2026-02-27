@@ -1,6 +1,8 @@
 import pandas as pd
 import streamlit as st
 
+DEFAULT_NEWS_SUMMARY_COUNT = 5
+
 
 def render_news_tab(
     stock_name,
@@ -10,7 +12,7 @@ def render_news_tab(
     collect_mainnews_latest,
     summarize_latest_news,
     is_openai_quota_error,
-    max_items=20,
+    max_items=60,
 ):
     st.header(f"📰 {stock_name} 최신 주요뉴스")
     used_mainnews_fallback = False
@@ -51,27 +53,29 @@ def render_news_tab(
         )
     display_cols = [c for c in ["일시", "언론사", "제목"] if c in display_df.columns]
     display_df = display_df[display_cols]
+    display_limit = min(20, len(display_df))
 
-    st.caption(f"최신순 상위 {len(news_df)}건")
+    st.caption(f"최신순 상위 {display_limit}건 (요약 후보 {len(news_df)}건)")
     st.dataframe(
-        display_df,
+        display_df.head(display_limit),
         hide_index=True,
         use_container_width=True,
         column_config=news_column_config,
     )
 
-    st.markdown("#### 최신 뉴스 요약")
-    n = st.slider("요약 대상 뉴스 수", 1, min(10, len(news_df)), min(5, len(news_df)), key=f"news_n_{stock_code}")
+    st.markdown("#### 중요도 반영 뉴스 요약")
+    n = min(DEFAULT_NEWS_SUMMARY_COUNT, len(news_df))
+    st.caption(f"최근 뉴스 {len(news_df)}건 중 중요도가 높은 {n}건을 요약합니다.")
     news_state_key = f"news_summary_text_{stock_code}"
 
-    if st.button("최신 뉴스 요약 생성", key=f"news_btn_{stock_code}"):
-        with st.spinner("최신 뉴스를 요약 중입니다..."):
+    if st.button("중요도 반영 뉴스 요약 생성", key=f"news_btn_{stock_code}"):
+        with st.spinner("중요도 반영 뉴스 요약 중입니다..."):
             try:
                 text, err = summarize_latest_news(news_df, stock_name, openai_api_key, n)
                 if err:
                     st.warning(err)
                 else:
-                    st.success(f"최근 뉴스 {n}건 요약 완료")
+                    st.success(f"중요도 반영 뉴스 {n}건 요약 완료")
                     st.session_state[news_state_key] = text
             except Exception as e:
                 if is_openai_quota_error(e):

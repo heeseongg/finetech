@@ -1,4 +1,5 @@
 ﻿import datetime
+import json
 import os
 import re
 import time
@@ -10,6 +11,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
 from tabs.disclosure import render_disclosure_tab
+from tabs.etf_components import render_etf_components_tab
 from tabs.flow import render_flow_tab
 from tabs.news import render_news_tab
 from tabs.price_chart import render_price_chart_tab
@@ -110,17 +112,16 @@ def fetch_news_article_text(news_url):
     return ""
 
 
-def summarize_major_disclosures(dart, major_df, stock_name, openai_api_key, top_n):
+def summarize_major_disclosures(dart, disclosure_df, stock_name, openai_api_key):
     if not openai_api_key:
-        return None, "요약 생성을 위해 .env에 OPENAI_API_KEY를 설정하세요."
-    if "rcept_no" not in major_df.columns or major_df.empty:
-        return None, "요약할 주요 보고서가 없습니다."
+        return None, None, "요약 생성을 위해 .env에 OPENAI_API_KEY를 설정하세요."
+    if "rcept_no" not in disclosure_df.columns or disclosure_df.empty:
+        return None, None, "요약할 공시가 없습니다."
 
-    selected = major_df.head(top_n)
     docs = []
     total_chars = 0
 
-    for _, row in selected.iterrows():
+    for _, row in disclosure_df.iterrows():
         rcp_no = str(row.get("rcept_no", "")).strip()
         if not rcp_no:
             continue
@@ -134,40 +135,380 @@ def summarize_major_disclosures(dart, major_df, stock_name, openai_api_key, top_
         rcept_dt = row.get("rcept_dt")
         if hasattr(rcept_dt, "strftime"):
             rcept_dt = rcept_dt.strftime("%Y-%m-%d")
+        reason = re.sub(r"\s+", " ", str(row.get("_summary_bucket", "")).strip())
+        title_line = f"[{rcept_dt}] {report_nm}"
+        if reason:
+            title_line += f" ({reason})"
 
-        snippet = f"[{rcept_dt}] {report_nm}\n{clean_text[:5000]}"
+        snippet = f"{title_line}\n{clean_text[:5000]}"
         docs.append(snippet)
         total_chars += len(snippet)
         if total_chars >= 45000:
             break
 
     if not docs:
-        return None, "본문을 불러올 수 있는 주요 보고서가 없습니다."
+        return None, None, "본문을 불러올 수 있는 공시가 없습니다."
+
+    prompt = (
+        f"{stock_name} 전자공시 요약을 작성해줘.\n"
+        "요약 대상은 최신 정기보고서 1건 + 최근 주요사항/정정공시 + 최신 감사/검토 보고서로 구성되어 있다.\n"
+        "출력 규칙:\n"
+        "1) 반드시 JSON 객체만 출력한다.\n"
+        "2) summary 섹션의 큰 숫자는 억/조 단위로 간결하게 표기한다.\n"
+        "3) metrics의 숫자/비율/금액은 문서 원문 값 그대로 쓴다. 없으면 '-'를 넣는다.\n"
+        "4) 섹션은 summary(핵심 요약, 긍정 포인트, 리스크 포인트)와 metrics 배열을 포함한다.\n"
+        "5) metrics 각 항목은 '항목', '값', '기준기간', '전기/전년 대비', '출처 공시' 키를 가진다.\n"
+        "6) 공시 근거가 약하면 추정하지 말고 '-'를 넣는다.\n"
+        "JSON 스키마 예시:\n"
+        "{\n"
+        '  "summary": {\n'
+        '    "핵심 요약": ["..."],\n'
+        '    "긍정 포인트": ["..."],\n'
+        '    "리스크 포인트": ["..."]\n'
+        "  },\n"
+        '  "metrics": [\n'
+        '    {"항목":"...", "값":"...", "기준기간":"...", "전기/전년 대비":"...", "출처 공시":"..."}\n'
+        "  ]\n"
+        "}\n\n"
+        "아래는 공시 원문 발췌:\n"
+        + "\n\n".join(docs)
+    )
 
     client = OpenAI(api_key=openai_api_key)
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {
-                "role": "system",
-                "content": "금융 공시 요약 전문가로서 문서 근거 중심의 한국어 요약만 작성하라.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"{stock_name} 최근 주요 보고서 요약을 작성해줘.\n"
-                    "형식:\n"
-                    "1) 핵심 요약(5줄 이내)\n"
-                    "2) 긍정 포인트(최대 3개)\n"
-                    "3) 리스크 포인트(최대 3개)\n"
-                    "4) 체크할 후속 공시(최대 3개)\n\n"
-                    + "\n\n".join(docs)
-                ),
-            },
-        ],
+    messages = [
+        {
+            "role": "system",
+            "content": "금융 공시 요약 전문가로서 문서 근거 중심의 한국어 요약만 작성하라.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=messages,
+        )
+    except Exception:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=messages,
+        )
+
+    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        return None, None, "요약 결과를 생성하지 못했습니다."
+
+    parsed = {}
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    summary_obj = parsed.get("summary", {}) if isinstance(parsed.get("summary"), dict) else {}
+
+    def _format_korean_compact_number(number):
+        abs_number = abs(number)
+        sign = "-" if number < 0 else ""
+
+        def _fmt(value):
+            if value >= 100:
+                return f"{value:,.0f}"
+            return f"{value:,.1f}".rstrip("0").rstrip(".")
+
+        if abs_number >= 1_000_000_000_000:
+            return f"{sign}{_fmt(abs_number / 1_000_000_000_000)}조"
+        if abs_number >= 100_000_000:
+            return f"{sign}{_fmt(abs_number / 100_000_000)}억"
+        return f"{number:,}"
+
+    def _compact_large_numbers_in_text(text):
+        pattern = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{9,})(\s*)(원|주|건)?")
+
+        def _replace(match):
+            raw_number = match.group(1)
+            spacing = match.group(2) or ""
+            unit = match.group(3) or ""
+            numeric = int(raw_number.replace(",", ""))
+            if numeric < 100_000_000:
+                return match.group(0)
+            compact = _format_korean_compact_number(numeric)
+            return f"{compact}{spacing}{unit}"
+
+        return pattern.sub(_replace, str(text or ""))
+
+    def _to_clean_lines(value, fallback):
+        if isinstance(value, str):
+            raw_items = [value]
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            raw_items = []
+
+        lines = []
+        for item in raw_items:
+            line = re.sub(r"\s+", " ", str(item or "")).strip()
+            if line:
+                lines.append(_compact_large_numbers_in_text(line))
+        if not lines and fallback:
+            lines = [fallback]
+        return lines
+
+    core_lines = _to_clean_lines(summary_obj.get("핵심 요약"), "핵심 요약을 생성하지 못했습니다.")
+    positive_lines = _to_clean_lines(summary_obj.get("긍정 포인트"), "문서 근거 기반 긍정 포인트가 부족합니다.")
+    risk_lines = _to_clean_lines(summary_obj.get("리스크 포인트"), "문서 근거 기반 리스크 포인트가 부족합니다.")
+
+    summary_text = (
+        "#### 핵심 요약\n"
+        + "\n".join(f"- {line}" for line in core_lines)
+        + "\n\n#### 긍정 포인트\n"
+        + "\n".join(f"- {line}" for line in positive_lines)
+        + "\n\n#### 리스크 포인트\n"
+        + "\n".join(f"- {line}" for line in risk_lines)
     )
-    return resp.choices[0].message.content, None
+
+    metrics_raw = parsed.get("metrics", [])
+    if isinstance(metrics_raw, dict):
+        metrics_raw = [metrics_raw]
+    if not isinstance(metrics_raw, list):
+        metrics_raw = []
+
+    metric_keys = {
+        "항목": ["항목", "item", "name"],
+        "값": ["값", "value"],
+        "기준기간": ["기준기간", "기간", "period"],
+        "전기/전년 대비": ["전기/전년 대비", "전기대비", "전년대비", "change"],
+        "출처 공시": ["출처 공시", "출처", "source", "보고서"],
+    }
+
+    metrics_rows = []
+    for row in metrics_raw[:15]:
+        if not isinstance(row, dict):
+            continue
+
+        normalized = {}
+        for target_key, aliases in metric_keys.items():
+            value = ""
+            for alias in aliases:
+                if alias in row:
+                    value = row.get(alias)
+                    break
+            value = re.sub(r"\s+", " ", str(value or "")).strip()
+            normalized[target_key] = value if value else "-"
+
+        if normalized["항목"] == "-" and normalized["값"] == "-":
+            continue
+        metrics_rows.append(normalized)
+
+    if not parsed:
+        summary_text = content
+        metrics_rows = []
+
+    return summary_text, metrics_rows, None
+
+
+NEWS_IMPORTANCE_WEIGHTS = {
+    "실적": 10,
+    "영업이익": 9,
+    "매출": 8,
+    "순이익": 8,
+    "가이던스": 9,
+    "수주": 8,
+    "계약": 6,
+    "배당": 6,
+    "자사주": 6,
+    "소각": 6,
+    "합병": 10,
+    "인수": 10,
+    "m&a": 10,
+    "유상증자": 12,
+    "전환사채": 12,
+    "신주인수권부사채": 12,
+    "cb": 10,
+    "bw": 10,
+    "감사의견": 11,
+    "소송": 10,
+    "제재": 10,
+    "영업정지": 10,
+    "적자": 8,
+    "하향": 7,
+    "정정": 5,
+}
+
+NEWS_CATEGORY_KEYWORDS = {
+    "리스크": [
+        "유상증자",
+        "전환사채",
+        "신주인수권부사채",
+        "cb",
+        "bw",
+        "소송",
+        "제재",
+        "영업정지",
+        "감사의견",
+        "적자",
+        "하향",
+        "부진",
+        "정정",
+    ],
+    "실적/펀더멘털": [
+        "실적",
+        "매출",
+        "영업이익",
+        "순이익",
+        "가이던스",
+        "수주",
+        "계약",
+        "배당",
+        "자사주",
+        "소각",
+    ],
+}
+
+
+def _parse_news_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return pd.NaT
+    normalized = re.sub(r"\s+", " ", text.replace(".", "-").replace("/", "-")).strip()
+    parsed = pd.to_datetime(normalized, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed
+
+    digits = re.sub(r"[^0-9]", "", text)
+    if len(digits) >= 8:
+        y, m, d = digits[:4], digits[4:6], digits[6:8]
+        hh = digits[8:10] if len(digits) >= 10 else "00"
+        mm = digits[10:12] if len(digits) >= 12 else "00"
+        parsed = pd.to_datetime(f"{y}-{m}-{d} {hh}:{mm}", errors="coerce")
+        if not pd.isna(parsed):
+            return parsed
+    return pd.NaT
+
+
+def _news_importance_score(title):
+    text = str(title or "")
+    lowered = text.lower()
+    score = 0.0
+    for keyword, weight in NEWS_IMPORTANCE_WEIGHTS.items():
+        if keyword.lower() in lowered:
+            score += float(weight)
+    return score
+
+
+def _classify_news_category(title):
+    lowered = str(title or "").lower()
+    for category, keywords in NEWS_CATEGORY_KEYWORDS.items():
+        if any(keyword.lower() in lowered for keyword in keywords):
+            return category
+    return "일반/시장"
+
+
+def _news_topic_key(title):
+    normalized = re.sub(r"[^0-9A-Za-z가-힣]+", "", str(title or "").lower())
+    return normalized[:30]
+
+
+def select_news_for_summary(news_df, top_n):
+    if news_df.empty:
+        return news_df.copy()
+    if "제목" not in news_df.columns:
+        return news_df.head(top_n).copy()
+
+    df = news_df.copy()
+    if "기사링크" in df.columns:
+        df["기사링크"] = df["기사링크"].fillna("").astype(str).str.strip()
+        has_link = df["기사링크"].ne("")
+        df_with_link = df[has_link].drop_duplicates(subset=["기사링크"], keep="first")
+        df_no_link = df[~has_link].drop_duplicates(subset=["제목"], keep="first")
+        df = pd.concat([df_with_link, df_no_link], axis=0)
+    else:
+        df = df.drop_duplicates(subset=["제목"], keep="first")
+
+    if "일시" in df.columns:
+        df["_parsed_dt"] = df["일시"].apply(_parse_news_datetime)
+        df = df.sort_values("_parsed_dt", ascending=False, na_position="last")
+    else:
+        df["_parsed_dt"] = pd.NaT
+
+    pool_size = min(len(df), max(top_n * 8, 40))
+    candidates = df.head(pool_size).copy()
+    candidates["_importance"] = candidates["제목"].apply(_news_importance_score)
+    candidates["_category"] = candidates["제목"].apply(_classify_news_category)
+    candidates["_topic_key"] = candidates["제목"].apply(_news_topic_key)
+
+    latest_ts = candidates["_parsed_dt"].dropna().max()
+    if pd.isna(latest_ts):
+        recency = pd.Series([1.0 - (idx / max(1, len(candidates))) for idx in range(len(candidates))], index=candidates.index)
+        candidates["_recency"] = recency.clip(lower=0.0)
+    else:
+        age_hours = ((latest_ts - candidates["_parsed_dt"]).dt.total_seconds() / 3600).clip(lower=0)
+        recency = (1.0 - (age_hours / (24 * 7))).clip(lower=0.0, upper=1.0)
+        candidates["_recency"] = recency.fillna(0.2)
+
+    max_importance = float(candidates["_importance"].max() or 0.0)
+    if max_importance > 0:
+        candidates["_importance_norm"] = candidates["_importance"] / max_importance
+    else:
+        candidates["_importance_norm"] = 0.0
+
+    candidates["_score"] = 0.6 * candidates["_importance_norm"] + 0.4 * candidates["_recency"]
+
+    ordered = candidates.sort_values(
+        by=["_score", "_importance", "_parsed_dt"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+
+    required_categories = []
+    if top_n >= 3:
+        required_categories = ["리스크", "실적/펀더멘털", "일반/시장"]
+    elif top_n == 2:
+        required_categories = ["리스크", "실적/펀더멘털"]
+
+    selected_indices = []
+    used_topics = set()
+
+    for category in required_categories:
+        for idx, row in ordered.iterrows():
+            if row.get("_category") != category or idx in selected_indices:
+                continue
+            topic_key = row.get("_topic_key", "")
+            if topic_key and topic_key in used_topics:
+                continue
+            selected_indices.append(idx)
+            if topic_key:
+                used_topics.add(topic_key)
+            break
+        if len(selected_indices) >= top_n:
+            break
+
+    for idx, row in ordered.iterrows():
+        if len(selected_indices) >= top_n:
+            break
+        if idx in selected_indices:
+            continue
+        topic_key = row.get("_topic_key", "")
+        if topic_key and topic_key in used_topics:
+            continue
+        selected_indices.append(idx)
+        if topic_key:
+            used_topics.add(topic_key)
+
+    if len(selected_indices) < top_n:
+        for idx in ordered.index:
+            if len(selected_indices) >= top_n:
+                break
+            if idx not in selected_indices:
+                selected_indices.append(idx)
+
+    selected = ordered.loc[selected_indices].copy()
+    return selected
 
 
 def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
@@ -176,7 +517,10 @@ def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
     if news_df.empty:
         return None, "요약할 뉴스가 없습니다."
 
-    selected = news_df.head(top_n)
+    selected = select_news_for_summary(news_df, top_n)
+    if selected.empty:
+        return None, "요약할 뉴스를 선별하지 못했습니다."
+
     docs = []
     total_chars = 0
 
@@ -185,6 +529,7 @@ def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
         date_text = str(row.get("일시", ""))
         press = str(row.get("언론사", ""))
         link = str(row.get("기사링크", ""))
+        category = str(row.get("_category", "")).strip()
 
         body = ""
         if link:
@@ -193,7 +538,8 @@ def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
             except Exception:
                 body = ""
 
-        snippet = f"[{date_text}] {title} ({press})\n{body[:2500]}"
+        category_tag = f"[{category}] " if category else ""
+        snippet = f"{category_tag}[{date_text}] {title} ({press})\n{body[:2500]}"
         docs.append(snippet)
         total_chars += len(snippet)
         if total_chars >= 35000:
@@ -214,10 +560,11 @@ def summarize_latest_news(news_df, stock_name, openai_api_key, top_n):
             {
                 "role": "user",
                 "content": (
-                    f"{stock_name} 최근 뉴스 요약을 작성해줘.\n"
+                    f"{stock_name} 중요도 반영 뉴스 요약을 작성해줘.\n"
+                    "아래 뉴스는 최신성, 중요도, 카테고리 다양성을 반영해 선별됐다.\n"
                     "형식:\n"
                     "1) 핵심 요약(5줄 이내)\n"
-                    "2) 시장 반응 포인트(최대 3개)\n"
+                    "2) 중요 이벤트 포인트(최대 4개)\n"
                     "3) 리스크/유의 포인트(최대 3개)\n\n"
                     + "\n\n".join(docs)
                 ),
@@ -1072,6 +1419,53 @@ def get_kis_valuation_metrics(stock_code, app_key, app_secret, kis_env):
     }
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def get_kis_etf_components(stock_code, app_key, app_secret, kis_env):
+    body = _kis_get(
+        app_key,
+        app_secret,
+        kis_env,
+        "/uapi/etfetn/v1/quotations/inquire-component-stock-price",
+        "FHKST121600C0",
+        {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_COND_SCR_DIV_CODE": "11216",
+        },
+    )
+
+    df = _to_dataframe(body.get("output2"))
+    if df.empty:
+        return pd.DataFrame(columns=["종목명", "현재가", "등락폭", "단위증권수", "구성시가총액", "비중(%)", "평가금액"])
+
+    rename_map = {
+        "hts_kor_isnm": "종목명",
+        "stck_prpr": "현재가",
+        "prdy_vrss": "등락폭",
+        "etf_cu_unit_scrt_cnt": "단위증권수",
+        "etf_cnfg_issu_avls": "구성시가총액",
+        "etf_cnfg_issu_rlim": "비중(%)",
+        "etf_vltn_amt": "평가금액",
+    }
+    available_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=available_map)
+
+    required_cols = ["종목명", "현재가", "등락폭", "단위증권수", "구성시가총액", "비중(%)", "평가금액"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    numeric_cols = ["현재가", "등락폭", "단위증권수", "구성시가총액", "비중(%)", "평가금액"]
+    for col in numeric_cols:
+        df[col] = _to_numeric_series(df[col].fillna("").astype(str))
+
+    df = df[required_cols].copy()
+    df["종목명"] = df["종목명"].fillna("").astype(str).str.strip()
+    df = df[df["종목명"] != ""].reset_index(drop=True)
+    df = df.sort_values("비중(%)", ascending=False, na_position="last")
+    return df.reset_index(drop=True)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_kis_daily_ohlcv(stock_code, app_key, app_secret, kis_env, days=90):
     end_date = datetime.date.today()
@@ -1275,11 +1669,16 @@ def app():
     st.title(f"📌 {stock_name} ({stock_code})")
     st.caption(f" {stock_industry or '정보 없음'}")
 
-    include_valuation_tab = str(stock_market or "").upper() != "ETF"
+    is_etf = str(stock_market or "").upper() == "ETF"
+    include_valuation_tab = not is_etf
     tab_labels = ["📈 주가 차트", "💹 외국인/기관 수급"]
     if include_valuation_tab:
         tab_labels.append("📊 밸류 지표")
-    tab_labels.extend(["🧾 투자 분석 리포트", "🗂️ 전자공시", "📰 뉴스"])
+    if is_etf:
+        tab_labels.append("🧩 구성종목")
+    else:
+        tab_labels.extend(["🧾 투자 분석 리포트", "🗂️ 전자공시"])
+    tab_labels.append("📰 뉴스")
     tabs = dict(zip(tab_labels, st.tabs(tab_labels)))
 
     with tabs["📈 주가 차트"]:
@@ -1324,32 +1723,46 @@ def app():
                 get_kis_investor_flow=get_kis_investor_flow,
             )
 
-    with tabs["🧾 투자 분석 리포트"]:
-        render_report_tab(
-            stock_name=stock_name,
-            stock_code=stock_code,
-            kis_app_key=kis_app_key,
-            kis_app_secret=kis_app_secret,
-            kis_env=kis_env,
-            collect_stocknews_by_code=collect_stocknews_by_code,
-            collect_mainnews_latest=collect_mainnews_latest,
-            get_kis_investor_flow=get_kis_investor_flow,
-            build_investment_report=build_investment_report,
-        )
-
-    with tabs["🗂️ 전자공시"]:
-        if not opendart_api:
-            st.warning("전자공시 조회를 위해 .env에 OPENDART_API_KEY를 설정하세요.")
-        else:
-            render_disclosure_tab(
+    if is_etf:
+        with tabs["🧩 구성종목"]:
+            if not kis_app_key or not kis_app_secret:
+                st.warning("ETF 구성종목 조회를 위해 .env에 KIS_APP_KEY, KIS_APP_SECRET를 설정하세요.")
+            else:
+                render_etf_components_tab(
+                    stock_name=stock_name,
+                    stock_code=stock_code,
+                    kis_app_key=kis_app_key,
+                    kis_app_secret=kis_app_secret,
+                    kis_env=kis_env,
+                    get_kis_etf_components=get_kis_etf_components,
+                )
+    else:
+        with tabs["🧾 투자 분석 리포트"]:
+            render_report_tab(
                 stock_name=stock_name,
                 stock_code=stock_code,
-                stock_market=stock_market,
-                opendart_api=opendart_api,
-                openai_api_key=openai_api,
-                summarize_major_disclosures=summarize_major_disclosures,
-                is_openai_quota_error=_is_openai_quota_error,
+                kis_app_key=kis_app_key,
+                kis_app_secret=kis_app_secret,
+                kis_env=kis_env,
+                collect_stocknews_by_code=collect_stocknews_by_code,
+                collect_mainnews_latest=collect_mainnews_latest,
+                get_kis_investor_flow=get_kis_investor_flow,
+                build_investment_report=build_investment_report,
             )
+
+        with tabs["🗂️ 전자공시"]:
+            if not opendart_api:
+                st.warning("전자공시 조회를 위해 .env에 OPENDART_API_KEY를 설정하세요.")
+            else:
+                render_disclosure_tab(
+                    stock_name=stock_name,
+                    stock_code=stock_code,
+                    stock_market=stock_market,
+                    opendart_api=opendart_api,
+                    openai_api_key=openai_api,
+                    summarize_major_disclosures=summarize_major_disclosures,
+                    is_openai_quota_error=_is_openai_quota_error,
+                )
 
     with tabs["📰 뉴스"]:
         render_news_tab(
