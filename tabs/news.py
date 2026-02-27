@@ -6,14 +6,19 @@ def render_news_tab(
     stock_name,
     stock_code,
     openai_api_key,
+    collect_stocknews_by_code,
     collect_mainnews_latest,
     summarize_latest_news,
     is_openai_quota_error,
     max_items=20,
 ):
     st.header(f"📰 {stock_name} 최신 주요뉴스")
+    used_mainnews_fallback = False
     try:
-        rows = collect_mainnews_latest(max_pages=5, max_items=max_items)
+        rows = collect_stocknews_by_code(stock_code, max_pages=5, max_items=max_items)
+        if not rows:
+            used_mainnews_fallback = True
+            rows = collect_mainnews_latest(max_pages=5, max_items=max_items)
     except Exception as e:
         st.error(f"뉴스 조회 중 오류가 발생했습니다: {type(e).__name__} - {e}")
         return
@@ -21,6 +26,9 @@ def render_news_tab(
     if not rows:
         st.info("표시할 주요뉴스가 없습니다.")
         return
+
+    if used_mainnews_fallback:
+        st.caption("종목 전용 뉴스가 부족해 네이버 금융 주요뉴스를 대체 표시합니다.")
 
     news_df = pd.DataFrame(rows)
     display_df = news_df.copy()

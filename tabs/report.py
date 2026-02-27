@@ -118,16 +118,24 @@ def render_report_tab(
     kis_app_key,
     kis_app_secret,
     kis_env,
+    collect_stocknews_by_code,
     collect_mainnews_latest,
     get_kis_investor_flow,
     build_investment_report,
 ):
     st.header(f"🧾 {stock_name} 투자 분석 리포트")
+    news_rows = []
     try:
-        news_rows = collect_mainnews_latest(max_pages=5, max_items=80)
-    except Exception as e:
-        st.error(f"리포트용 뉴스 수집 중 오류가 발생했습니다: {type(e).__name__} - {e}")
-        return
+        news_rows = collect_stocknews_by_code(stock_code, max_pages=8, max_items=80)
+    except Exception:
+        news_rows = []
+
+    if not news_rows:
+        try:
+            news_rows = collect_mainnews_latest(max_pages=5, max_items=80)
+        except Exception as e:
+            st.error(f"리포트용 뉴스 수집 중 오류가 발생했습니다: {type(e).__name__} - {e}")
+            return
 
     flow_df = pd.DataFrame()
     if kis_app_key and kis_app_secret:

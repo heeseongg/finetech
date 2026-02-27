@@ -298,6 +298,74 @@ def collect_mainnews_latest(max_pages=3, max_items=20):
     return rows
 
 
+def _to_absolute_naver_url(href):
+    value = str(href or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("//"):
+        return "https:" + value
+    if value.startswith("/"):
+        return "https://finance.naver.com" + value
+    return "https://finance.naver.com/" + value.lstrip("/")
+
+
+@st.cache_data(ttl=180)
+def collect_stocknews_by_code(stock_code, max_pages=5, max_items=20):
+    code = str(stock_code or "").strip()
+    if not code:
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"https://finance.naver.com/item/news.naver?code={code}",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+    rows = []
+    seen_urls = set()
+
+    for page in range(1, max_pages + 1):
+        res = requests.get(
+            "https://finance.naver.com/item/news_news.naver",
+            headers=headers,
+            params={"code": code, "page": page, "clusterId": ""},
+            timeout=10,
+        )
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, "html.parser")
+        anchors = soup.select("table.type5 td.title a")
+        if not anchors:
+            continue
+
+        for a in anchors:
+            href = _to_absolute_naver_url(a.get("href", ""))
+            if not href or href in seen_urls:
+                continue
+
+            td = a.find_parent("td")
+            tr = td.find_parent("tr") if td else None
+            press_node = tr.select_one("td.info") if tr else None
+            wdate_node = tr.select_one("td.date") if tr else None
+
+            title_text = re.sub(r"\s+", " ", a.get_text(" ", strip=True)).strip() or "기사보기"
+            press_text = press_node.get_text(" ", strip=True) if press_node else ""
+            date_text = wdate_node.get_text(" ", strip=True) if wdate_node else ""
+
+            seen_urls.add(href)
+            rows.append(
+                {
+                    "일시": date_text,
+                    "언론사": press_text,
+                    "제목": title_text,
+                    "기사링크": href,
+                }
+            )
+            if len(rows) >= max_items:
+                return rows
+    return rows
+
+
 POSITIVE_NEWS_KEYWORDS = [
     "상승",
     "호재",
@@ -1263,6 +1331,7 @@ def app():
             kis_app_key=kis_app_key,
             kis_app_secret=kis_app_secret,
             kis_env=kis_env,
+            collect_stocknews_by_code=collect_stocknews_by_code,
             collect_mainnews_latest=collect_mainnews_latest,
             get_kis_investor_flow=get_kis_investor_flow,
             build_investment_report=build_investment_report,
@@ -1287,6 +1356,7 @@ def app():
             stock_name=stock_name,
             stock_code=stock_code,
             openai_api_key=openai_api,
+            collect_stocknews_by_code=collect_stocknews_by_code,
             collect_mainnews_latest=collect_mainnews_latest,
             summarize_latest_news=summarize_latest_news,
             is_openai_quota_error=_is_openai_quota_error,

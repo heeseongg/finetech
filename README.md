@@ -13,21 +13,21 @@
   - 시가총액/거래대금/거래량 정렬은 KIS 랭킹 API 사용
   - KIS 키가 없거나 호출 실패 시 이름순 fallback
 
-![종목 선택](images/1.종목%20선택.png)
+<img src="images/1.종목%20선택.png" alt="종목 선택" height="500">
 
 ### 2) 주가 차트 탭
 - KIS 일봉 데이터 조회
 - 실시간 현재가/등락 표시
 - 기간 슬라이더 기반 차트 + 최근 데이터 테이블
 
-![주가 차트](images/2.주가%20차트.png)
+<img src="images/2.주가%20차트.png" alt="주가 차트" height="500">
 
 ### 3) 외국인/기관 수급 탭
 - KIS 수급 데이터 조회
 - 외국인/개인/기관 순매수 추이 표시
 - 최근 수급값 요약 + 테이블
 
-![외국인 기관 수급](images/3.외국인%20기관%20수급.png)
+<img src="images/3.외국인%20기관%20수급.png" alt="외국인 기관 수급" height="500">
 
 ### 4) 밸류 지표 탭 (주식만 표시)
 - 표시 지표: `PER`, `PBR`, `EV/EBITDA`
@@ -37,14 +37,14 @@
   - EV/EBITDA: KIS 기타 주요비율
 - **ETF 선택 시 탭 자체를 숨김**
 
-![밸류 지표](images/4.밸류%20지표.png)
+<img src="images/4.밸류%20지표.png" alt="밸류 지표" width="400">
 
 ### 5) 투자 분석 리포트 탭
-- 네이버 금융 주요 뉴스 + KIS 수급을 결합한 규칙 기반 리포트
+- 네이버 금융 **종목 뉴스(종목코드 기반)** + KIS 수급을 결합한 규칙 기반 리포트
 - 시장 심리 %, 의견(매수 우위/관망/매도 우위), 신뢰도, 최근 감성 추이
-- 관련 뉴스가 부족한 경우 보수적 fallback 로직 적용
+- 종목 뉴스가 부족한 경우 네이버 금융 주요 뉴스로 fallback
 
-![투자 분석 리포트](images/5.투자%20분석%20리포트.png)
+<img src="images/5.투자%20분석%20리포트.png" alt="투자 분석 리포트" height="500">
 
 ### 6) 전자공시 탭
 - OpenDART 기반 공시 조회
@@ -52,14 +52,16 @@
 - ETF: 펀드 공시(kind=`G`)를 최근 구간(30/90일)에서 ETF명 매칭
 - 주요 보고서 요약(OpenAI API 설정 시)
 
-![전자공시](images/6.전자공시.png)
+<img src="images/6.전자공시.png" alt="전자공시" height="500">
 
 ### 7) 뉴스 탭
-- 네이버 금융 주요 뉴스 수집
+- 네이버 금융 종목 뉴스 수집
+  - 기본: `https://finance.naver.com/item/news.naver?code={종목코드}` (내부 목록: `item/news_news.naver`)
+  - fallback: 종목 뉴스가 비면 네이버 금융 주요 뉴스 사용
 - 기사 링크 제공
 - 최신 뉴스 요약(OpenAI API 설정 시)
 
-![뉴스](images/7.뉴스.png)
+<img src="images/7.뉴스.png" alt="뉴스" height="500">
 
 ---
 
@@ -67,7 +69,7 @@
 - 종목 목록: `KRX`
 - 주가/수급/밸류 지표: `한국투자증권(KIS) Open API`
 - 전자공시: `OpenDART`
-- 뉴스: `네이버 금융`
+- 뉴스: `네이버 금융 종목 뉴스(item/news.naver?code=...)` + 부족 시 `mainnews` fallback
 - 요약: `OpenAI API` (선택)
 
 ---
