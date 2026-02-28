@@ -713,40 +713,57 @@ def collect_stocknews_by_code(stock_code, max_pages=5, max_items=20):
     return rows
 
 
-POSITIVE_NEWS_KEYWORDS = [
-    "상승",
-    "호재",
-    "기대",
-    "개선",
-    "성장",
-    "확대",
-    "흑자",
-    "강세",
-    "회복",
-    "상향",
-    "급등",
-    "수혜",
-    "사상 최대",
-    "돌파",
-]
+POSITIVE_NEWS_WEIGHTS = {
+    "상승": 1.0,
+    "호재": 1.4,
+    "기대": 0.8,
+    "개선": 0.9,
+    "성장": 1.0,
+    "확대": 0.8,
+    "흑자": 1.4,
+    "강세": 1.1,
+    "회복": 1.0,
+    "상향": 1.2,
+    "급등": 1.5,
+    "수혜": 1.2,
+    "사상 최대": 1.7,
+    "돌파": 1.3,
+    "계약 체결": 1.1,
+    "수주": 1.2,
+    "증가": 0.7,
+}
 
-NEGATIVE_NEWS_KEYWORDS = [
-    "하락",
-    "악재",
-    "우려",
-    "불확실성",
-    "둔화",
-    "적자",
-    "약세",
-    "축소",
-    "급락",
-    "하향",
-    "리스크",
-    "부진",
-    "부담",
-    "경고",
-    "충격",
-]
+NEGATIVE_NEWS_WEIGHTS = {
+    "하락": 1.0,
+    "악재": 1.5,
+    "우려": 1.1,
+    "불확실성": 1.2,
+    "둔화": 1.0,
+    "적자": 1.4,
+    "약세": 1.0,
+    "축소": 0.8,
+    "급락": 1.6,
+    "하향": 1.2,
+    "리스크": 1.2,
+    "부진": 1.1,
+    "부담": 0.9,
+    "경고": 1.2,
+    "충격": 1.5,
+    "감소": 0.7,
+}
+
+SENTIMENT_PHRASE_OVERRIDES = {
+    "우려 해소": 1.6,
+    "적자 축소": 1.3,
+    "손실 축소": 1.3,
+    "흑자 전환": 1.8,
+    "실적 개선": 1.5,
+    "실적 부진": -1.6,
+    "실적 악화": -1.8,
+    "적자 전환": -1.9,
+    "목표가 하향": -1.7,
+    "목표가 상향": 1.6,
+}
 
 GENERIC_NAME_TOKENS = {
     "etf",
@@ -780,14 +797,174 @@ ETF_BRAND_TOKENS = {
 
 def _news_sentiment_score(text):
     t = str(text or "").lower()
-    pos = sum(1 for w in POSITIVE_NEWS_KEYWORDS if w in t)
-    neg = sum(1 for w in NEGATIVE_NEWS_KEYWORDS if w in t)
-    raw = pos - neg
-    if raw > 0:
-        return min(raw, 3) / 3
-    if raw < 0:
-        return max(raw, -3) / 3
-    return 0.0
+    if not t:
+        return 0.0
+
+    pos_raw = sum(weight for keyword, weight in POSITIVE_NEWS_WEIGHTS.items() if keyword in t)
+    neg_raw = sum(weight for keyword, weight in NEGATIVE_NEWS_WEIGHTS.items() if keyword in t)
+    raw = pos_raw - neg_raw
+
+    for phrase, delta in SENTIMENT_PHRASE_OVERRIDES.items():
+        if phrase in t:
+            raw += float(delta)
+
+    raw = max(-6.0, min(6.0, raw))
+    if raw == 0:
+        return 0.0
+    return raw / 6.0
+
+
+def _weighted_average(values, weights):
+    value_series = pd.to_numeric(values, errors="coerce")
+    weight_series = pd.to_numeric(weights, errors="coerce").fillna(0.0)
+    valid = value_series.notna() & weight_series.gt(0)
+    if not valid.any():
+        if value_series.notna().any():
+            return float(value_series.dropna().mean())
+        return 0.0
+
+    value_series = value_series[valid]
+    weight_series = weight_series[valid]
+    total_weight = float(weight_series.sum())
+    if total_weight <= 0:
+        return float(value_series.mean()) if not value_series.empty else 0.0
+    return float((value_series * weight_series).sum() / total_weight)
+
+
+def _prepare_weighted_sentiment_frame(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["제목", "일시", "기사링크", "sent_score", "news_weight"])
+
+    out = df.copy()
+    out["일시"] = pd.to_datetime(out.get("일시"), errors="coerce")
+    out["sent_score"] = out["제목"].apply(_news_sentiment_score)
+    out["_importance_raw"] = out["제목"].apply(_news_importance_score)
+    out["_importance_weight"] = (1.0 + (out["_importance_raw"] / 12.0)).clip(lower=1.0, upper=3.0)
+
+    latest_ts = out["일시"].dropna().max()
+    if pd.isna(latest_ts):
+        out["_recency_weight"] = 0.35
+    else:
+        age_hours = ((latest_ts - out["일시"]).dt.total_seconds() / 3600.0).clip(lower=0)
+        recency = 0.5 ** (age_hours / 48.0)
+        out["_recency_weight"] = recency.fillna(0.35).clip(lower=0.15, upper=1.0)
+
+    out["news_weight"] = (out["_importance_weight"] * out["_recency_weight"]).clip(lower=0.15, upper=3.5)
+    return out
+
+
+def _build_recent_sentiment_trend(scored_df, top_n_days=7):
+    if scored_df is None or scored_df.empty or "일시" not in scored_df.columns:
+        return pd.DataFrame(columns=["일자", "감성지수"])
+
+    trend_source = scored_df.dropna(subset=["일시"]).copy()
+    if trend_source.empty:
+        return pd.DataFrame(columns=["일자", "감성지수"])
+
+    trend_source["일자"] = trend_source["일시"].dt.normalize()
+    daily_rows = []
+    for day, group in trend_source.groupby("일자"):
+        day_score = _weighted_average(group["sent_score"], group["news_weight"])
+        daily_rows.append(
+            {
+                "일자": day,
+                "감성지수": max(0.0, min(100.0, 50 + (day_score * 50))),
+            }
+        )
+
+    if not daily_rows:
+        return pd.DataFrame(columns=["일자", "감성지수"])
+
+    top_n = max(1, int(top_n_days))
+    trend_df = pd.DataFrame(daily_rows).sort_values("일자").tail(top_n).reset_index(drop=True)
+    if len(trend_df) >= top_n:
+        return trend_df
+
+    end_day = trend_df["일자"].max()
+    calendar_df = pd.DataFrame({"일자": pd.date_range(end=end_day, periods=top_n, freq="D").normalize()})
+    merged = calendar_df.merge(trend_df, on="일자", how="left")
+
+    filled = []
+    prev = 50.0
+    for value in merged["감성지수"]:
+        if pd.isna(value):
+            current = (prev * 0.7) + (50.0 * 0.3)
+        else:
+            current = float(value)
+        current = max(0.0, min(100.0, current))
+        filled.append(current)
+        prev = current
+
+    merged["감성지수"] = filled
+    return merged.reset_index(drop=True)
+
+
+def _select_related_news(news_df, stock_name, stock_code=""):
+    if news_df is None or news_df.empty:
+        return pd.DataFrame(columns=news_df.columns if isinstance(news_df, pd.DataFrame) else None)
+
+    base = news_df.copy()
+    if "제목" in base.columns:
+        base["제목"] = base["제목"].fillna("").astype(str).str.strip()
+    else:
+        base["제목"] = ""
+
+    code = str(stock_code or "").strip()
+    if code and "기사링크" in base.columns:
+        link_series = base["기사링크"].fillna("").astype(str)
+        code_mask = link_series.str.contains(rf"(?:[?&]code={re.escape(code)}(?:&|$))", case=False, regex=True)
+        if code_mask.any():
+            return base[code_mask].copy()
+
+    keywords = [k.lower() for k in _stock_keywords(stock_name)]
+    if keywords:
+        title_mask = base["제목"].str.lower().apply(lambda t: any(k in t for k in keywords))
+        if title_mask.any():
+            return base[title_mask].copy()
+
+    return pd.DataFrame(columns=base.columns)
+
+
+def _recent_coverage_days(scored_df):
+    if scored_df is None or scored_df.empty or "일시" not in scored_df.columns:
+        return 0
+    today = pd.Timestamp(datetime.date.today())
+    start_day = today - pd.Timedelta(days=6)
+    dated = scored_df.dropna(subset=["일시"]).copy()
+    if dated.empty:
+        return 0
+    days = dated["일시"].dt.normalize()
+    covered = days[days.between(start_day.normalize(), today.normalize(), inclusive="both")]
+    return int(covered.dropna().nunique())
+
+
+def _align_bonus(news_score, flow_score, has_flow):
+    if not has_flow:
+        return 0
+    gap = abs(float(news_score) - float(flow_score))
+    bonus = 6 - int(round(gap * 4))
+    return max(0, bonus)
+
+
+def _calibrate_confidence(combined_score, scored_df, flow_text, news_score, flow_score):
+    news_count = int(len(scored_df)) if scored_df is not None else 0
+    data_bonus = min(12, int(news_count * 1.2))
+    coverage_bonus = min(8, _recent_coverage_days(scored_df))
+    consistency_bonus = _align_bonus(news_score, flow_score, bool(flow_text))
+    base = 50 + (abs(float(combined_score)) * 30) + data_bonus + coverage_bonus + consistency_bonus
+    return int(max(45, min(95, round(base))))
+
+
+def _lookback_news(df, days=30):
+    if df is None or df.empty or "일시" not in df.columns:
+        return df
+    dated = df.dropna(subset=["일시"]).copy()
+    if dated.empty:
+        return df.copy()
+    latest_ts = dated["일시"].max()
+    cutoff = latest_ts - pd.Timedelta(days=max(1, int(days)))
+    sliced = df[(df["일시"].isna()) | (df["일시"] >= cutoff)].copy()
+    return sliced if not sliced.empty else df.copy()
 
 
 def _normalize_keyword_token(token):
@@ -875,7 +1052,7 @@ def _sentiment_meta(sentiment_pct):
     return "Neutral", "관망", "중립 신호"
 
 
-def build_investment_report(stock_name, news_rows, flow_df):
+def build_investment_report(stock_name, news_rows, flow_df, stock_code=""):
     empty_trend_df = pd.DataFrame(columns=["일자", "감성지수"])
     news_df = pd.DataFrame(news_rows)
     if news_df.empty:
@@ -891,14 +1068,15 @@ def build_investment_report(stock_name, news_rows, flow_df):
             "news_count": 0,
         }
 
-    news_df["제목"] = news_df["제목"].astype(str).str.strip()
-    news_df["일시"] = pd.to_datetime(news_df["일시"], errors="coerce")
-    keywords = [k.lower() for k in _stock_keywords(stock_name)]
-
-    related_df = pd.DataFrame(columns=news_df.columns)
-    if keywords:
-        related_mask = news_df["제목"].str.lower().apply(lambda t: any(k in t for k in keywords))
-        related_df = news_df[related_mask].copy()
+    if "제목" in news_df.columns:
+        news_df["제목"] = news_df["제목"].astype(str).str.strip()
+    else:
+        news_df["제목"] = ""
+    if "일시" in news_df.columns:
+        news_df["일시"] = news_df["일시"].apply(_parse_news_datetime)
+    else:
+        news_df["일시"] = pd.NaT
+    related_df = _select_related_news(news_df, stock_name, stock_code=stock_code)
 
     flow_text, flow_score = _flow_signal_text(flow_df)
 
@@ -932,15 +1110,29 @@ def build_investment_report(stock_name, news_rows, flow_df):
             "news_count": 0,
         }
 
-    related_df["sent_score"] = related_df["제목"].apply(_news_sentiment_score)
-    news_score = float(related_df["sent_score"].mean())
+    dedupe_cols = [c for c in ["기사링크", "제목", "일시"] if c in related_df.columns]
+    if dedupe_cols:
+        related_df = related_df.drop_duplicates(subset=dedupe_cols, keep="first")
+    related_df = _lookback_news(related_df, days=30)
+    scored_df = _prepare_weighted_sentiment_frame(related_df)
+    if scored_df.empty:
+        return {
+            "summary": "분석 가능한 뉴스가 부족합니다. 잠시 후 다시 시도해 주세요.",
+            "sentiment_pct": 50,
+            "sentiment_label": "Neutral",
+            "opinion": "관망",
+            "confidence": 50,
+            "trend_df": empty_trend_df,
+            "positive_points": [],
+            "negative_points": [],
+            "news_count": 0,
+        }
 
+    news_score = _weighted_average(scored_df["sent_score"], scored_df["news_weight"])
     combined_score = (news_score * 0.75) + (flow_score * 0.25)
     sentiment_pct = int(round(max(0.0, min(100.0, 50 + combined_score * 50))))
     sentiment_label, opinion, signal_text = _sentiment_meta(sentiment_pct)
-
-    data_bonus = min(10, int(len(related_df) * 1.5))
-    confidence = int(max(45, min(95, 55 + abs(sentiment_pct - 50) * 0.6 + data_bonus + (5 if flow_text else 0))))
+    confidence = _calibrate_confidence(combined_score, scored_df, flow_text, news_score, flow_score)
 
     if flow_text:
         first_sentence = f"최근 {flow_text}와 뉴스 흐름에서 {signal_text}가 포착되었습니다."
@@ -948,30 +1140,15 @@ def build_investment_report(stock_name, news_rows, flow_df):
         first_sentence = f"최근 뉴스 흐름에서 {signal_text}가 포착되었습니다."
 
     risk_words = ["금리", "환율", "인플레이션", "침체", "불확실성", "리스크"]
-    risk_exists = related_df["제목"].str.contains("|".join(risk_words), case=False, regex=True).any()
+    risk_exists = scored_df["제목"].str.contains("|".join(risk_words), case=False, regex=True).any()
     if risk_exists:
         second_sentence = "다만 거시 환경 리스크와 단기 변동성에는 유의가 필요합니다."
     else:
         second_sentence = "다만 단기 변동성 확대 가능성은 함께 점검해야 합니다."
 
-    trend_df = related_df.dropna(subset=["일시"]).copy()
-    if trend_df.empty:
-        trend_df = empty_trend_df
-    else:
-        trend_df["일자"] = trend_df["일시"].dt.normalize()
-        trend_df = trend_df.groupby("일자", as_index=False)["sent_score"].mean()
-        trend_df["감성지수"] = (50 + trend_df["sent_score"] * 50).clip(0, 100)
-        trend_df = trend_df[["일자", "감성지수"]].sort_values("일자")
-        if len(trend_df) > 7:
-            trend_df = trend_df.tail(7)
-        elif len(trend_df) < 7 and not trend_df.empty:
-            end_day = trend_df["일자"].max()
-            full_days = pd.date_range(end=end_day, periods=7, freq="D")
-            trend_df = (
-                pd.DataFrame({"일자": full_days})
-                .merge(trend_df, on="일자", how="left")
-                .fillna({"감성지수": 50})
-            )
+    trend_df = _build_recent_sentiment_trend(scored_df)
+    scored_df = scored_df.copy()
+    scored_df["_impact"] = scored_df["sent_score"] * scored_df["news_weight"]
 
     def _to_point_records(df_slice):
         records = []
@@ -987,18 +1164,18 @@ def build_investment_report(stock_name, news_rows, flow_df):
         return records
 
     pos_points = _to_point_records(
-        related_df[related_df["sent_score"] > 0]
-        .sort_values(["sent_score", "일시"], ascending=[False, False])
+        scored_df[scored_df["_impact"] > 0]
+        .sort_values(["_impact", "일시"], ascending=[False, False])
         .head(2)
     )
     neg_points = _to_point_records(
-        related_df[related_df["sent_score"] < 0]
-        .sort_values(["sent_score", "일시"], ascending=[True, False])
+        scored_df[scored_df["_impact"] < 0]
+        .sort_values(["_impact", "일시"], ascending=[True, False])
         .head(2)
     )
 
-    if not pos_points and not related_df.empty:
-        pos_points = _to_point_records(related_df.sort_values("일시", ascending=False).head(1))
+    if not pos_points and not scored_df.empty:
+        pos_points = _to_point_records(scored_df.sort_values("일시", ascending=False).head(1))
 
     return {
         "summary": f"{first_sentence} {second_sentence}",
@@ -1009,7 +1186,7 @@ def build_investment_report(stock_name, news_rows, flow_df):
         "trend_df": trend_df,
         "positive_points": pos_points,
         "negative_points": neg_points,
-        "news_count": int(len(related_df)),
+        "news_count": int(len(scored_df)),
     }
 
 
@@ -1627,14 +1804,30 @@ def app():
 
         selected = None
         if not df_list.empty:
-            options = list(
-                zip(
-                    df_list["Code"].astype(str),
-                    df_list["Name"].astype(str),
-                    df_list["Market"].astype(str),
-                )
+            normalized = df_list[["Code", "Name", "Market"]].copy()
+            normalized["Code"] = normalized["Code"].astype(str).str.strip().str.zfill(6)
+            normalized["Name"] = normalized["Name"].astype(str).str.strip()
+            normalized["Market"] = normalized["Market"].astype(str).str.strip()
+
+            code_to_meta = {
+                row.Code: (row.Name, row.Market)
+                for row in normalized.itertuples(index=False)
+            }
+            stock_codes = list(code_to_meta.keys())
+
+            selected_code_key = f"selected_stock_code_{market}"
+            current_code = st.session_state.get(selected_code_key)
+            if current_code not in stock_codes:
+                st.session_state[selected_code_key] = stock_codes[0]
+
+            selected_code = st.selectbox(
+                "📌 종목 선정",
+                stock_codes,
+                key=selected_code_key,
+                format_func=lambda code: f"{code_to_meta[code][0]}({code})",
             )
-            selected = st.selectbox("📌 종목 선정", options, format_func=lambda x: f"{x[1]}({x[0]})")
+            selected_name, selected_market = code_to_meta[selected_code]
+            selected = (selected_code, selected_name, selected_market)
         else:
             st.warning("선택 가능한 종목이 없습니다.")
 

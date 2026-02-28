@@ -144,7 +144,7 @@ def render_report_tab(
         except Exception:
             flow_df = pd.DataFrame()
 
-    report = build_investment_report(stock_name, news_rows, flow_df)
+    report = build_investment_report(stock_name, news_rows, flow_df, stock_code=stock_code)
 
     with st.container(border=True):
         st.write(report["summary"])
@@ -156,7 +156,7 @@ def render_report_tab(
             st.markdown(f"## {report['sentiment_pct']}%")
             st.caption(report["sentiment_label"])
             st.caption(
-                "뉴스 감성 점수(긍정/부정 키워드) 75% + "
+                "뉴스 감성(가중 키워드 + 중요도 + 최신성) 75% + "
                 "외국인/기관 순매수 점수 25%를 합산해 0~100으로 환산"
             )
     with col2:
@@ -170,7 +170,7 @@ def render_report_tab(
             )
 
     with st.container(border=True):
-        st.markdown("#### 최근 7일간 감성 지수 추이")
+        st.markdown("#### 최근 7일 감성 지수 추이")
         trend_df = report["trend_df"]
         if trend_df.empty:
             st.info("감성 추이를 계산할 데이터가 부족합니다.")
@@ -248,8 +248,8 @@ def render_report_tab(
                     )
                 st.altair_chart(trend_chart, use_container_width=True)
                 st.caption(
-                    "뉴스 제목 일자별 평균 감성 점수(긍정/부정 키워드)를 "
-                    "0~100 지수로 변환해 최근 7일 표시"
+                    "뉴스 기사 일시를 일자 단위로 집계한 뒤 최근 7일로 표시하며, "
+                    "기사일이 부족한 구간은 중립값(50) 방향으로 완만 보정"
                 )
 
     with st.container(border=True):

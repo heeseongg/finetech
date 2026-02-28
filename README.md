@@ -69,6 +69,8 @@
   - `종목명`, `현재가`, `등락폭`, `단위증권수`, `구성시가총액`, `비중(%)`, `평가금액`
 - **주식 선택 시 탭 자체를 숨김**
 
+<img src="images/7.구성종목.png" alt="구성종목" width="400">
+
 ### 8) 뉴스 탭
 - 네이버 금융 종목 뉴스 수집
   - 기본: `https://finance.naver.com/item/news.naver?code={종목코드}` (내부 목록: `item/news_news.naver`)
@@ -79,7 +81,7 @@
   - 중요도(이벤트 키워드) + 최신성 + 카테고리 다양성(리스크/실적·펀더멘털/일반) 반영
   - 자동 선별 상위 5건 요약
 
-<img src="images/7.뉴스.png" alt="뉴스" height="500">
+<img src="images/8.뉴스.png" alt="뉴스" height="500">
 
 ---
 
